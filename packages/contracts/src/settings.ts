@@ -763,6 +763,57 @@ export const OpenCodeSettings = makeProviderSettingsSchema(
 export type OpenCodeSettings = typeof OpenCodeSettings.Type;
 
 /**
+ * Agent Relay is unlike every other built-in driver: it does not spawn or
+ * own a local subprocess. It attaches over WebSocket to an already-running
+ * agent managed by a separate Agent Relay broker process. There is no
+ * binary path and no local login flow — credentials are the broker URL and
+ * API key the user copies out of the Agent Relay CLI.
+ */
+export const AgentRelaySettings = makeProviderSettingsSchema(
+  {
+    // Off by default like Cursor, Grok, and OpenCode: this driver needs a
+    // broker URL before it can do anything. Users opt in from Settings.
+    enabled: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+    brokerUrl: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Broker URL",
+        description:
+          "WebSocket URL for the Agent Relay broker control plane, from the Agent Relay CLI.",
+        providerSettingsForm: {
+          placeholder: "wss://broker.example.com/ws",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    apiKey: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "API key",
+        description:
+          "Attach token for the broker session. Stored in plain text on this environment.",
+        providerSettingsForm: {
+          control: "password",
+          placeholder: "Optional",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    customModels: Schema.Array(CustomModelSetting).pipe(
+      Schema.withDecodingDefault(Effect.succeed([])),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+  },
+  {
+    order: ["brokerUrl", "apiKey"],
+  },
+);
+export type AgentRelaySettings = typeof AgentRelaySettings.Type;
+
+/**
  * A read-only quota source outside this environment's provider CLIs. The
  * only kind today is a CLIProxyAPI hub, whose management API reports the
  * windows of every pooled account. The key travels in settings for now, like

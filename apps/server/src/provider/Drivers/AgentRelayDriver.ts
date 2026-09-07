@@ -13,6 +13,7 @@ import { AgentRelaySettings, ProviderDriverKind } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { HttpClient } from "effect/unstable/http";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -45,6 +46,7 @@ const DRIVER_KIND = ProviderDriverKind.make("agentrelay");
 export type AgentRelayDriverEnv =
   | BackgroundPolicy.BackgroundPolicy
   | Crypto.Crypto
+  | HttpClient.HttpClient
   | ServerSettingsService;
 
 export const AgentRelayDriver: ProviderDriver<AgentRelaySettings, AgentRelayDriverEnv> = {

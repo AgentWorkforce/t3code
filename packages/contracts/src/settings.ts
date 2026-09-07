@@ -838,9 +838,9 @@ export const AgentRelaySettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "Broker URL",
         description:
-          "WebSocket URL for the Agent Relay broker control plane, from the Agent Relay CLI. In Workspace mode, include a literal {name} placeholder that T3 Code substitutes with the resolved agent name (falls back to appending ?agent=<name> when omitted).",
+          "Base HTTP(S) URL for the Agent Relay broker (agent-relay-broker), from the Agent Relay CLI, e.g. https://broker.example.com. T3 Code derives the WebSocket output stream and the HTTP input endpoint from this one URL — do not include /ws or a trailing path.",
         providerSettingsForm: {
-          placeholder: "wss://broker.example.com/ws",
+          placeholder: "https://broker.example.com",
           clearWhenEmpty: "omit",
         },
       }),
@@ -850,10 +850,22 @@ export const AgentRelaySettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "API key",
         description:
-          "Attach token for the broker session. Stored in plain text on this environment.",
+          "Sent as the broker's X-API-Key header. Stored in plain text on this environment.",
         providerSettingsForm: {
           control: "password",
           placeholder: "Optional",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    agentName: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Agent name",
+        description:
+          "Name of the already-running Agent Relay worker to attach to. Required in Single agent mode: the broker's WebSocket stream carries every worker on that broker, and this is how T3 Code tells them apart. Not used in Workspace mode, which resolves a name per thread instead.",
+        providerSettingsForm: {
+          placeholder: "Worker1",
           clearWhenEmpty: "omit",
         },
       }),
@@ -877,7 +889,7 @@ export const AgentRelaySettings = makeProviderSettingsSchema(
     ),
   },
   {
-    order: ["mode", "workspaceKey", "brokerUrl", "apiKey", "defaultSpawnCli"],
+    order: ["mode", "workspaceKey", "brokerUrl", "apiKey", "agentName", "defaultSpawnCli"],
   },
 );
 export type AgentRelaySettings = typeof AgentRelaySettings.Type;

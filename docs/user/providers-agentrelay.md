@@ -20,14 +20,19 @@ In **Settings → Providers**, add an Agent Relay instance, set **Mode** to
 
 - **Workspace key** — the Relaycast workspace key (`rk_live_...`) from the Agent
   Relay CLI (`agent-relay workspace` or wherever you provisioned it).
-- **Broker URL** — the Agent Relay broker's attach endpoint. In this mode it is a
-  template: include a literal `{name}` where the agent's name goes (for example
-  `wss://broker.example.com/agents/{name}`); if you omit it, T3 Code appends
-  `?agent=<name>` instead.
+- **Broker URL** — the base URL of the `agent-relay-broker` process itself, e.g.
+  `https://broker.example.com` (no `/ws` or other path — T3 Code derives both the
+  output stream and the input endpoint from this one URL).
 - **API key** — the broker's own attach credential (separate from the workspace
   key — see "Two different credentials" below).
 - **Spawn CLI** — which CLI (Claude Code, Codex, Gemini, ...) Agent Relay launches
   for a brand-new thread.
+
+A broker can run more than one agent at once, and T3 Code tells them apart by
+name: whichever agent Workspace mode resolves for a thread (spawned fresh or
+resumed from a prior session) is the only one that thread's output and input
+apply to, even though the underlying connection carries every agent on that
+broker.
 
 Starting a thread that already has an agent bound to it (including one it spawned
 itself in a previous session) reconnects to that same agent rather than spawning
@@ -45,10 +50,12 @@ an agent is found or spawned. See `docs/internals/providers.md` for why.
 ## Single agent mode (legacy)
 
 Attach to exactly one already-running agent with no discovery: set **Mode** to
-**Single agent**, and enter the **Broker URL** and **API key** for that one agent's
-attach session, as printed by the Agent Relay CLI. Nothing is spawned and nothing
-else in the workspace is visible from this instance. Use this when you only ever
-want T3 Code to see one specific agent.
+**Single agent**, and enter the **Broker URL**, **API key**, and **Agent name**
+for that one agent, as printed by the Agent Relay CLI. The agent name is
+required here — the broker's connection carries every agent running on it, and
+without a name T3 Code has no way to tell them apart. Nothing is spawned and
+nothing else in the workspace is visible from this instance. Use this when you
+only ever want T3 Code to see one specific agent.
 
 ## Credentials are Agent Relay's, not T3 Code's
 

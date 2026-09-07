@@ -49,13 +49,22 @@ directory that the adapter is the only thing writing to the process (e.g. approv
 gating) do not hold here — a message another attached client typed can appear as
 input this adapter never sent.
 
-v1 speaks only the broker's terminal transport (`worker_stream` frames in,
-`sendInput` frames out), so there are no structured turn, tool-call, or approval
-events — turn completion is inferred from the terminal going quiet
-(`TURN_IDLE_COMPLETE_MS`), not reported by the agent. Agent Relay's structured
-`AgentEventEnvelope` protocol (`@agent-relay/harness-driver`) would remove that
-heuristic and add real approvals, but only two Agent Relay harnesses speak it
-natively today; adopting it is a distinct v2 adapter, not a v1 extension.
+v1 speaks only the broker's terminal transport: `worker_stream` events over `/ws`
+(discriminated by `kind`, not `type`; payload in `chunk`, not `data`) and a plain
+`POST /api/input/{name}` for keystrokes. This was verified against Agent Relay's
+own source (`crates/broker/src/protocol.rs`'s `BrokerEvent::WorkerStream` and its
+serde round-trip test, `@agent-relay/harness-driver`'s `HarnessDriverClient`) and
+confirmed live against a real `agent-relay-broker` running a real `claude
+--version` under its PTY — not a guess. One consequence that is easy to miss: the
+broker broadcasts every worker on it over the same `/ws` connection, so
+`AgentRelayAdapter` filters incoming frames by `name` against the session's
+resolved agent — a session that skipped this would occasionally render another
+thread's output. There are no structured turn, tool-call, or approval events, so
+turn completion is inferred from the terminal going quiet (`TURN_IDLE_COMPLETE_MS`),
+not reported by the agent. Agent Relay's structured `AgentEventEnvelope` protocol
+(`@agent-relay/harness-driver`) would remove that heuristic and add real
+approvals, but only two Agent Relay harnesses speak it natively today; adopting
+it is a distinct v2 adapter, not a v1 extension.
 
 ### Workspace mode: two credential domains that do not bridge today
 
@@ -85,32 +94,36 @@ separate systems:
   Neither surface's agent/node records (`RelayAgent`, `RelayNode`) carry a broker
   URL or API key.
 - The actual PTY attach (`HarnessDriverClient`/`BrokerTransport` in
-  `@agent-relay/harness-driver`) is a *different* credential: the local
+  `@agent-relay/harness-driver`) is a _different_ credential: the local
   `agent-relay-broker` process's own `X-API-Key`-authenticated HTTP/WS API
   (`/ws`, `/api/input/{name}/stream`), resolved by the CLI's `attach` command from
   `--broker-url`/`--api-key`, `RELAY_BROKER_URL`/`RELAY_BROKER_API_KEY`, or
-  `connection.json` — never from a workspace key. (Relay's own tracked gap here is
-  issue #1382, "attach pairs broker URL/key from different sources".)
+  `connection.json` — never from a workspace key.
 
-So workspace mode still asks for both a workspace key (discovery/spawn) *and* a
-broker URL/API key (attach) — it cannot derive one from the other. If Agent Relay
-ever adds a workspace-key-derivable attach credential (a `brokerUrl`/`apiKey` on
-`RelayAgent`/`RelayNode`, or a new MCP tool), that field is exactly what should
-replace the second credential here.
+So workspace mode still asks for both a workspace key (discovery/spawn) _and_ a
+broker URL/API key (attach) — it cannot derive one from the other. Filed
+upstream as AgentWorkforce/relay#1698 (open, deliberately without a proposed
+fix — bridging these is an auth-boundary design decision, not something to
+guess at from the integration side). Do not confuse this with
+AgentWorkforce/relay#1382, a separate, already-fixed bug about the CLI's own
+`resolveBrokerConnection` mixing an env-sourced key with a file-sourced URL
+_within_ the broker-credential domain — orthogonal to the gap _between_
+domains described here. If Agent Relay ever adds a workspace-key-derivable
+attach credential (a `brokerUrl`/`apiKey` on `RelayAgent`/`RelayNode`, or a new
+MCP tool), that field is exactly what should replace the second credential
+here.
 
-A second, narrower gap: the real per-agent attach protocol
-(`harness-driver/src/transport.ts`) is a **two-channel**, ack/keepalive-based
-protocol (`GET/PUT .../delivery-mode`, a shared `/ws?sinceSeq=` event stream
-multiplexed by agent `name`, and a separate `/api/input/{name}/stream` for
-writes with `pty_input_ready`/`pty_input_ack` flow control) — nothing like the v1
-adapter's single bidirectional `worker_stream`/`sendInput` socket. Reproducing
-that protocol is out of scope here for the same reason the v1 wire-format gap
-above is: it is a distinct v2 adapter. Workspace mode's `brokerUrl` setting is
-therefore a T3-Code-side convention layered on the *existing* v1 guess — a
-`{name}` placeholder (or a `?agent=<name>` fallback) substituted by
-`buildWorkspaceAttachUrl` — not a real Agent Relay contract. Whoever builds the v2
-adapter should replace both the frame format and this URL convention together
-against `harness-driver`'s real transport.
+A second, narrower gap: `harness-driver/src/transport.ts` also exposes a
+**streaming** input path (`/api/input/{name}/stream`, a persistent, ack'd,
+keepalive'd WebSocket with `pty_input_ready`/`pty_input_ack` flow control) for
+high-throughput writes. `AgentRelayAdapter` uses the plain one-shot
+`POST /api/input/{name}` instead — the same call `HarnessDriverClient.sendInput`
+makes — which is a real, correct, verified endpoint, just not the
+highest-throughput one. Moving to the streaming variant is a v2 adapter, not a
+v1 gap: nothing about it is wrong today, it just does not need the extra
+machinery for a chat-turn cadence of input. Workspace mode's `brokerUrl` is the
+same plain broker base URL single mode uses — there is no per-mode URL
+convention; only which `name` a session filters/targets differs.
 
 Presence (used to detect a freshly-spawned agent coming online, and to notice one
 going offline) uses `AgentRelay#addListener("agent.status.*", ...)` — the one

@@ -6,24 +6,38 @@
  * already-running Agent Relay broker (`agent-relay-broker`, a separate
  * process this server does not manage) and attaches to one already-running
  * agent the same way Agent Relay's own external terminal clients do:
- * receiving `worker_stream` terminal-output frames and replying with
- * `sendInput` keystroke frames over the same socket. See
- * `docs/internals/providers.md` for why this is v1 scope and what a v2
- * structured-protocol adapter would add.
+ * receiving `worker_stream` terminal-output frames over `/ws` and sending
+ * keystrokes via a separate HTTP POST. See `docs/internals/providers.md`
+ * for why this is v1 scope and what a v2 structured-protocol adapter would
+ * add.
  *
- * Wire-format note: the exact JSON shape of `worker_stream` / `sendInput`
- * frames is not vendored into this repo, so `parseAgentRelayFrame` and
- * `encodeSendInputFrame` below are the single, isolated boundary that
- * assumes a shape (`{ type: "worker_stream", data: string }` in,
- * `{ type: "sendInput", data: string }` out). If the real broker's frames
- * differ, only these two functions need to change.
+ * Wire format: verified directly against Agent Relay's own source
+ * (`crates/broker/src/protocol.rs`'s `BrokerEvent::WorkerStream` and its
+ * serde round-trip test, plus `@agent-relay/harness-driver`'s
+ * `HarnessDriverClient`/`BrokerTransport`), and confirmed live against a
+ * real `agent-relay-broker` — not a guess:
+ *
+ * - Output: every event over `/ws` is a JSON object discriminated by
+ *   `kind` (not `type`). A `worker_stream` event carries `name`, `stream`,
+ *   `chunk` (not `data`), and an optional `offset`. The broker broadcasts
+ *   every worker on it over the same socket, so `parseAgentRelayFrame`
+ *   returns the frame's `name` and `handleIncomingText` filters by
+ *   `ctx.agentName` — a session must not react to another worker's output.
+ * - Auth: both `/ws` and the HTTP API take the API key as an `X-API-Key`
+ *   header, not `Authorization: Bearer`.
+ * - Input: `POST {brokerBaseUrl}/api/input/{name}` with JSON body
+ *   `{ data: string }`, not a message sent over `/ws`. Agent Relay also
+ *   has a higher-throughput streaming input WebSocket
+ *   (`/api/input/{name}/stream`, with acks and keepalives) that this
+ *   adapter does not use — the plain POST is simpler and was enough to
+ *   verify correct end-to-end.
  *
  * Workspace mode: when `agentRelaySettings.mode === "workspace"`, a thread
  * with no agent bound to it yet spawns one through `workspaceClient` and
  * waits for it to come online (see `waitForAgentOnline`) before
  * connecting — everything from `connect()` down is untouched, reused exactly
- * as v1 built it. See `docs/internals/providers.md` for the credential and
- * wire-format caveats that come with this.
+ * as v1 built it. See `docs/internals/providers.md` for the credential
+ * caveat that comes with this.
  *
  * @module AgentRelayAdapterLive
  */
@@ -49,6 +63,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 import WebSocket from "ws";
 
 import {
@@ -86,21 +101,14 @@ const AGENT_SPAWN_POLL_INTERVAL = Duration.seconds(2);
 const AgentRelayResumeCursorSchema = Schema.Struct({ agentName: Schema.String });
 const isAgentRelayResumeCursor = Schema.is(AgentRelayResumeCursorSchema);
 
-const AGENT_NAME_PLACEHOLDER = "{name}";
+/** `https://broker.example.com` -> `wss://broker.example.com/ws`. */
+function toWsUrl(brokerBaseUrl: string): string {
+  return `${brokerBaseUrl.replace(/^http/, "ws")}/ws`;
+}
 
-/**
- * Workspace mode has no real per-agent attach endpoint to build this from
- * (see `docs/internals/providers.md`), so this is a T3-Code-side convention
- * layered on top of the same placeholder `brokerUrl` setting single mode
- * already uses verbatim: substitute a literal `{name}` placeholder when
- * present, otherwise append `?agent=<name>`.
- */
-function buildWorkspaceAttachUrl(brokerUrlTemplate: string, agentName: string): string {
-  if (brokerUrlTemplate.includes(AGENT_NAME_PLACEHOLDER)) {
-    return brokerUrlTemplate.split(AGENT_NAME_PLACEHOLDER).join(encodeURIComponent(agentName));
-  }
-  const separator = brokerUrlTemplate.includes("?") ? "&" : "?";
-  return `${brokerUrlTemplate}${separator}agent=${encodeURIComponent(agentName)}`;
+/** `https://broker.example.com` -> `https://broker.example.com/api/input/<name>`. */
+function toInputUrl(brokerBaseUrl: string, agentName: string): string {
+  return `${brokerBaseUrl}/api/input/${encodeURIComponent(agentName)}`;
 }
 
 /** Derive a valid, deterministic Relaycast agent name for a thread's spawn,
@@ -167,12 +175,16 @@ interface AgentRelaySessionContext {
   readonly threadId: ThreadId;
   session: ProviderSession;
   readonly scope: Scope.Closeable;
-  /** Resolved connection URL for this thread's session. Equal to
-   * `agentRelaySettings.brokerUrl` in single mode; in workspace mode, the
-   * template with the resolved agent name substituted in
-   * (`buildWorkspaceAttachUrl`). Fixed for the life of the session, so
-   * reconnects keep attaching to the same agent. */
-  readonly wsUrl: string;
+  /** Base HTTP(S) broker URL (`agentRelaySettings.brokerUrl`, trimmed).
+   * `/ws` and `/api/input/<name>` are both derived from this. */
+  readonly brokerBaseUrl: string;
+  /** The specific worker this session attaches to. Resolved once at
+   * `startSession` (single mode: `agentRelaySettings.agentName`; workspace
+   * mode: the resumed or freshly-spawned agent's name) and fixed for the
+   * life of the session — reconnects keep attaching to the same agent.
+   * The broker's `/ws` broadcasts every worker on it, so every incoming
+   * frame is filtered against this before the session reacts to it. */
+  readonly agentName: string;
   socket: WebSocket | undefined;
   reconnectAttempt: number;
   activeTurnId: TurnId | undefined;
@@ -183,12 +195,17 @@ interface AgentRelaySessionContext {
 }
 
 /**
- * Parse one incoming text frame. Returns `undefined` for anything that does
- * not match the assumed `worker_stream` shape (non-JSON, a different
- * `type`, or a missing text field) so an unrecognized broker message is
- * ignored instead of tearing down the session.
+ * Parse one incoming `/ws` frame. Returns `undefined` for anything that is
+ * not a `worker_stream` event for some worker (non-JSON, a different
+ * `kind`, or a missing `name`/`chunk`) so an unrecognized or irrelevant
+ * broker message is ignored instead of tearing down the session. Matching
+ * `name` against the session's target agent is the caller's job
+ * (`handleIncomingText`) — the broker broadcasts every worker on it over
+ * this one socket.
  */
-function parseAgentRelayFrame(raw: string): { readonly text: string } | undefined {
+function parseAgentRelayFrame(
+  raw: string,
+): { readonly name: string; readonly text: string } | undefined {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -197,20 +214,9 @@ function parseAgentRelayFrame(raw: string): { readonly text: string } | undefine
   }
   if (typeof parsed !== "object" || parsed === null) return undefined;
   const record = parsed as Record<string, unknown>;
-  if (record.type !== "worker_stream" && record.type !== "workerStream") return undefined;
-  const text =
-    typeof record.data === "string"
-      ? record.data
-      : typeof record.chunk === "string"
-        ? record.chunk
-        : typeof record.text === "string"
-          ? record.text
-          : undefined;
-  return text !== undefined ? { text } : undefined;
-}
-
-function encodeSendInputFrame(data: string): string {
-  return JSON.stringify({ type: "sendInput", data });
+  if (record.kind !== "worker_stream") return undefined;
+  if (typeof record.name !== "string" || typeof record.chunk !== "string") return undefined;
+  return { name: record.name, text: record.chunk };
 }
 
 function describeError(cause: unknown): string {
@@ -226,6 +232,7 @@ export function makeAgentRelayAdapter(
     const crypto = yield* Crypto.Crypto;
     const context = yield* Effect.context<never>();
     const fork = Effect.runForkWith(context);
+    const httpClient = yield* HttpClient.HttpClient;
 
     const sessions = new Map<ThreadId, AgentRelaySessionContext>();
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
@@ -272,16 +279,32 @@ export function makeAgentRelayAdapter(
       return Effect.succeed(ctx);
     };
 
-    const sendFrame = (ctx: AgentRelaySessionContext, payload: string): boolean => {
-      const socket = ctx.socket;
-      if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-      try {
-        socket.send(payload);
-        return true;
-      } catch {
-        return false;
-      }
-    };
+    /** `POST /api/input/{name}` — see the module doc for why this is a
+     * separate HTTP call rather than a message over the `/ws` socket. */
+    const postInput = (
+      ctx: AgentRelaySessionContext,
+      data: string,
+    ): Effect.Effect<void, ProviderAdapterRequestError> =>
+      Effect.gen(function* () {
+        const apiKey = agentRelaySettings.apiKey.trim();
+        let request = HttpClientRequest.post(toInputUrl(ctx.brokerBaseUrl, ctx.agentName)).pipe(
+          HttpClientRequest.bodyJsonUnsafe({ data }),
+        );
+        if (apiKey) {
+          request = request.pipe(HttpClientRequest.setHeader("X-API-Key", apiKey));
+        }
+        yield* httpClient.execute(request).pipe(Effect.flatMap(HttpClientResponse.filterStatusOk));
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "sendInput",
+              detail: `Failed to send input to the Agent Relay broker: ${describeError(cause)}`,
+              cause,
+            }),
+        ),
+      );
 
     const completeActiveTurn = (
       ctx: AgentRelaySessionContext,
@@ -361,7 +384,9 @@ export function makeAgentRelayAdapter(
         const liveCtx = sessions.get(ctx.threadId);
         if (liveCtx !== ctx || ctx.stopped) return;
         const frame = parseAgentRelayFrame(raw);
-        if (!frame) return;
+        // Not a worker_stream frame, or another worker's output — the
+        // broker broadcasts every worker on this connection.
+        if (!frame || frame.name !== ctx.agentName) return;
         yield* Queue.offer(ctx.activitySignals, undefined);
         yield* offerRuntimeEvent({
           type: "content.delta",
@@ -429,13 +454,12 @@ export function makeAgentRelayAdapter(
     const connect = (ctx: AgentRelaySessionContext): void => {
       if (ctx.stopped) return;
       const apiKey = agentRelaySettings.apiKey.trim();
+      const wsUrl = toWsUrl(ctx.brokerBaseUrl);
       let socket: WebSocket;
       try {
         socket = apiKey
-          ? new WebSocket(ctx.wsUrl, {
-              headers: { authorization: `Bearer ${apiKey}` },
-            })
-          : new WebSocket(ctx.wsUrl);
+          ? new WebSocket(wsUrl, { headers: { "X-API-Key": apiKey } })
+          : new WebSocket(wsUrl);
       } catch (cause) {
         dispatch(handleConnectFailure(ctx, describeError(cause)));
         return;
@@ -492,14 +516,15 @@ export function makeAgentRelayAdapter(
           });
         }
 
-        // Workspace mode: resolve which agent this thread attaches to. A
-        // resume cursor from a prior `startSession` on this thread means an
-        // agent is already bound — reconnect to that same one. No cursor
-        // means this is the thread's first session: spawn a fresh agent and
+        // Resolve which agent this thread attaches to. Single mode always
+        // targets the one configured `agentName`. Workspace mode: a resume
+        // cursor from a prior `startSession` on this thread means an agent
+        // is already bound — reconnect to that same one; no cursor means
+        // this is the thread's first session, so spawn a fresh agent and
         // wait for it to come online before attaching, so a brand-new
         // Agent Relay thread never requires a pre-existing target the way
-        // v1 did.
-        let targetAgentName: string | undefined;
+        // single mode does.
+        let targetAgentName: string;
         if (agentRelaySettings.mode === "workspace") {
           if (isAgentRelayResumeCursor(input.resumeCursor)) {
             targetAgentName = input.resumeCursor.agentName;
@@ -534,11 +559,19 @@ export function makeAgentRelayAdapter(
             yield* waitForAgentOnline(workspaceClient, spawned.name);
             targetAgentName = spawned.name;
           }
+        } else {
+          const configuredName = agentRelaySettings.agentName.trim();
+          if (!configuredName) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "startSession",
+              issue:
+                "Agent Relay Single agent mode requires an agent name: the broker's WebSocket stream carries every worker on it, and T3 Code needs a name to tell them apart.",
+            });
+          }
+          targetAgentName = configuredName;
         }
-        const wsUrl =
-          targetAgentName !== undefined
-            ? buildWorkspaceAttachUrl(agentRelaySettings.brokerUrl, targetAgentName)
-            : agentRelaySettings.brokerUrl;
+        const brokerBaseUrl = agentRelaySettings.brokerUrl.trim();
 
         const existing = sessions.get(input.threadId);
         if (existing) {
@@ -555,9 +588,7 @@ export function makeAgentRelayAdapter(
           runtimeMode: input.runtimeMode,
           ...(input.cwd ? { cwd: input.cwd } : {}),
           threadId: input.threadId,
-          ...(targetAgentName !== undefined
-            ? { resumeCursor: { agentName: targetAgentName } }
-            : {}),
+          resumeCursor: { agentName: targetAgentName },
           createdAt: now,
           updatedAt: now,
         };
@@ -565,7 +596,8 @@ export function makeAgentRelayAdapter(
           threadId: input.threadId,
           session,
           scope,
-          wsUrl,
+          brokerBaseUrl,
+          agentName: targetAgentName,
           socket: undefined,
           reconnectAttempt: 0,
           activeTurnId: undefined,
@@ -614,13 +646,7 @@ export function makeAgentRelayAdapter(
               "Turn requires non-empty text. Agent Relay's terminal transport cannot carry attachments.",
           });
         }
-        if (!sendFrame(ctx, encodeSendInputFrame(`${text}\n`))) {
-          return yield* new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "sendInput",
-            detail: "Failed to send input to the Agent Relay broker socket.",
-          });
-        }
+        yield* postInput(ctx, `${text}\n`);
 
         const isNewTurn = ctx.activeTurnId === undefined;
         const turnId = ctx.activeTurnId ?? TurnId.make(yield* randomUUIDv4);
@@ -664,7 +690,9 @@ export function makeAgentRelayAdapter(
         }
         // Ctrl-C: the terminal-native interrupt signal, matching how a human
         // attached to the same broker session would cancel a running command.
-        sendFrame(ctx, encodeSendInputFrame("\u0003"));
+        // Best-effort, same as the original WS-send version was — a
+        // failed cancel should not fail the interrupt itself.
+        yield* postInput(ctx, "\u0003").pipe(Effect.ignore);
         yield* completeActiveTurn(ctx, turnId, "cancelled");
       });
 

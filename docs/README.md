@@ -18,7 +18,7 @@
 - [Running in the background](./user/background-service.md)
 - [Updating T3 Code](./user/updating.md)
 - [External sessions](./user/external-sessions.md)
-- Provider guides: [Codex](./user/providers-codex.md) · [Claude](./user/providers-claude.md) · [OpenCode](./user/providers-opencode.md) · [Antigravity](./user/providers-antigravity.md)
+- Provider guides: [Codex](./user/providers-codex.md) · [Claude](./user/providers-claude.md) · [OpenCode](./user/providers-opencode.md) · [Antigravity](./user/providers-antigravity.md) · [Agent Relay](./user/providers-agentrelay.md)
 
 ---
 

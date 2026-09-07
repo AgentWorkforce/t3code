@@ -771,14 +771,16 @@ export type OpenCodeSettings = typeof OpenCodeSettings.Type;
  * Two modes share this one schema, the same way `AntigravitySettings.authMethod`
  * keeps every method's fields flat instead of branching the struct:
  *
- * - `single` (default, legacy v1): the broker URL and API key identify one
- *   already-running agent directly. Nothing to discover or spawn.
- * - `workspace`: `workspaceKey` is a Relaycast workspace key (`rk_live_...`)
- *   used to list and spawn agents in that workspace. The broker URL and API
- *   key are still required in this mode — they are a *separate* credential
- *   domain (the local `agent-relay-broker`'s own PTY attach API, not
- *   Relaycast) that nothing in Agent Relay's MCP/SDK surface currently
- *   derives from a workspace key. See `docs/internals/providers.md`.
+ * - `workspace` (default): `workspaceKey` is a Relaycast workspace key
+ *   (`rk_live_...`) used to list and spawn agents in that workspace. The
+ *   broker URL and API key are still required in this mode — they are a
+ *   *separate* credential domain (the local `agent-relay-broker`'s own PTY
+ *   attach API, not Relaycast) that nothing in Agent Relay's MCP/SDK
+ *   surface currently derives from a workspace key. See
+ *   `docs/internals/providers.md`.
+ * - `single` (manual opt-in, legacy v1): the broker URL and API key
+ *   identify one already-running agent directly. Nothing to discover or
+ *   spawn.
  */
 // Order matters beyond readability: `ProviderSettingsForm.tsx`'s select
 // control treats the first entry as the default for a fresh, unconfigured

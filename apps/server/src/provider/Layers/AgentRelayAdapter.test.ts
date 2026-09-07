@@ -181,7 +181,9 @@ const waitUntil = (predicate: () => boolean): Effect.Effect<void> =>
 const agentRelayAdapterTestLayer = Layer.provideMerge(NodeServices.layer, FetchHttpClient.layer);
 
 const makeTestAdapter = (brokerUrl: string, agentName = "Worker1", apiKey = "test-key") =>
-  makeAgentRelayAdapter(decodeAgentRelaySettings({ enabled: true, brokerUrl, agentName, apiKey }));
+  makeAgentRelayAdapter(
+    decodeAgentRelaySettings({ enabled: true, mode: "single", brokerUrl, agentName, apiKey }),
+  );
 
 it.layer(agentRelayAdapterTestLayer)("AgentRelayAdapterLive", (it) => {
   it.effect("streams worker_stream frames as content.delta and posts input over HTTP", () =>
@@ -354,6 +356,7 @@ it.layer(agentRelayAdapterTestLayer)("AgentRelayAdapterLive", (it) => {
       const adapter = yield* makeAgentRelayAdapter(
         decodeAgentRelaySettings({
           enabled: true,
+          mode: "single",
           brokerUrl: "",
           agentName: "Worker1",
           apiKey: "",
@@ -372,6 +375,7 @@ it.layer(agentRelayAdapterTestLayer)("AgentRelayAdapterLive", (it) => {
       const adapter = yield* makeAgentRelayAdapter(
         decodeAgentRelaySettings({
           enabled: true,
+          mode: "single",
           brokerUrl: "http://127.0.0.1:1",
           agentName: "",
           apiKey: "",

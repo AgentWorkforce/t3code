@@ -808,11 +808,14 @@ export const AgentRelaySettings = makeProviderSettingsSchema(
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
     mode: AgentRelayMode.pipe(
-      Schema.withDecodingDefault(Effect.succeed("single" as const)),
+      // Workspace is the default: it needs no manually-typed agent name and
+      // discovers/spawns agents automatically. Single is the deliberate
+      // manual opt-in (see docs/user/providers-agentrelay.md).
+      Schema.withDecodingDefault(Effect.succeed("workspace" as const)),
       Schema.annotateKey({
         title: "Mode",
         description:
-          "Single agent attaches to the one agent identified below. Workspace discovers every agent in the workspace and spawns new ones for new threads.",
+          "Workspace (default) discovers every agent in the workspace and spawns new ones for new threads. Single agent attaches to exactly one agent, identified by name below, with no discovery.",
         providerSettingsForm: {
           control: "select",
           options: AGENT_RELAY_MODES,

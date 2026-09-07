@@ -12,6 +12,7 @@ import { WebSocketServer, type WebSocket as WsSocket } from "ws";
 
 import { AgentRelaySettings, ThreadId, type ProviderRuntimeEvent } from "@t3tools/contracts";
 
+import type { AgentRelayWorkspaceClientShape } from "../Services/AgentRelayWorkspaceClient.ts";
 import { makeAgentRelayAdapter } from "./AgentRelayAdapter.ts";
 
 const decodeAgentRelaySettings = Schema.decodeSync(AgentRelaySettings);
@@ -59,10 +60,45 @@ function forkNodeEventWait<A>(register: (resume: (value: A) => void) => void) {
 const forkConnectionWait = (server: WebSocketServer) =>
   forkNodeEventWait<WsSocket>((resume) => server.once("connection", resume));
 
+/** Like `forkConnectionWait`, but also captures the upgrade request's URL —
+ * workspace mode encodes the resolved agent name into it. */
+const forkConnectionWaitWithUrl = (server: WebSocketServer) =>
+  forkNodeEventWait<{ readonly socket: WsSocket; readonly url: string }>((resume) =>
+    server.once("connection", (socket, request) => resume({ socket, url: request.url ?? "" })),
+  );
+
 const forkMessageWait = (socket: WsSocket) =>
   forkNodeEventWait<string>((resume) =>
     socket.once("message", (data: Buffer) => resume(data.toString("utf8"))),
   );
+
+/**
+ * A workspace client whose `spawnAgent` immediately marks the spawned name
+ * "online" for `listAgents`, so `waitForAgentOnline`'s polling fallback
+ * resolves on its very first check with no clock manipulation needed —
+ * `onPresenceChange` is left a no-op here to specifically exercise that
+ * fallback rather than the (unverifiable, see AgentRelayWorkspaceClientLive.ts)
+ * presence push path.
+ */
+const makeFakeWorkspaceClient = () =>
+  Effect.gen(function* () {
+    const spawnCalls = yield* Ref.make<ReadonlyArray<string>>([]);
+    const online = yield* Ref.make<ReadonlyArray<string>>([]);
+    const shape: AgentRelayWorkspaceClientShape = {
+      listAgents: () =>
+        Ref.get(online).pipe(
+          Effect.map((names) => names.map((name) => ({ name, status: "online" as const }))),
+        ),
+      spawnAgent: (input) =>
+        Effect.gen(function* () {
+          yield* Ref.update(spawnCalls, (calls) => [...calls, input.name]);
+          yield* Ref.update(online, (names) => [...names, input.name]);
+          return { name: input.name };
+        }),
+      onPresenceChange: () => () => {},
+    };
+    return { shape, spawnCalls };
+  });
 
 /**
  * Collects every event the adapter emits from the moment this is called.
@@ -226,6 +262,100 @@ it.layer(agentRelayAdapterTestLayer)("AgentRelayAdapterLive", (it) => {
         decodeAgentRelaySettings({ enabled: true, brokerUrl: "", apiKey: "" }),
       );
       const threadId = ThreadId.make("agentrelay-missing-url");
+      const failure = yield* adapter
+        .startSession({ threadId, runtimeMode: "full-access" })
+        .pipe(Effect.flip);
+      assert.equal(failure._tag, "ProviderAdapterValidationError");
+    }),
+  );
+});
+
+it.layer(agentRelayAdapterTestLayer)("AgentRelayAdapterLive workspace mode", (it) => {
+  const makeWorkspaceTestAdapter = (
+    brokerUrlTemplate: string,
+    workspaceClient: AgentRelayWorkspaceClientShape | undefined,
+  ) =>
+    makeAgentRelayAdapter(
+      decodeAgentRelaySettings({
+        enabled: true,
+        mode: "workspace",
+        brokerUrl: brokerUrlTemplate,
+        apiKey: "test-key",
+        workspaceKey: "rk_live_test",
+        defaultSpawnCli: "claude",
+      }),
+      workspaceClient ? { workspaceClient } : {},
+    );
+
+  it.effect("spawns a new agent, waits for it online, and attaches with its resolved name", () =>
+    Effect.gen(function* () {
+      const { server, url } = yield* Effect.promise(startMockBroker);
+      yield* Effect.addFinalizer(() => Effect.sync(() => server.close()));
+
+      const { shape: workspaceClient, spawnCalls } = yield* makeFakeWorkspaceClient();
+      const adapter = yield* makeWorkspaceTestAdapter(`${url}/agents/{name}`, workspaceClient);
+      const connectionFiber = yield* forkConnectionWaitWithUrl(server);
+
+      const threadId = ThreadId.make("agentrelay-workspace-spawn");
+      const session = yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+      const connection = yield* Fiber.join(connectionFiber);
+
+      assert.deepEqual(yield* Ref.get(spawnCalls), ["t3code-agentrelay-workspace-spawn"]);
+      assert.equal(connection.url, "/agents/t3code-agentrelay-workspace-spawn");
+      assert.deepEqual(session.resumeCursor, { agentName: "t3code-agentrelay-workspace-spawn" });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("reconnecting with a persisted resume cursor does not spawn again", () =>
+    Effect.gen(function* () {
+      const { server, url } = yield* Effect.promise(startMockBroker);
+      yield* Effect.addFinalizer(() => Effect.sync(() => server.close()));
+
+      const { shape: workspaceClient, spawnCalls } = yield* makeFakeWorkspaceClient();
+      const adapter = yield* makeWorkspaceTestAdapter(`${url}/agents/{name}`, workspaceClient);
+      const connectionFiber = yield* forkConnectionWaitWithUrl(server);
+
+      const threadId = ThreadId.make("agentrelay-workspace-resume");
+      const session = yield* adapter.startSession({
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor: { agentName: "already-running-agent" },
+      });
+      const connection = yield* Fiber.join(connectionFiber);
+
+      assert.deepEqual(yield* Ref.get(spawnCalls), []);
+      assert.equal(connection.url, "/agents/already-running-agent");
+      assert.deepEqual(session.resumeCursor, { agentName: "already-running-agent" });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("falls back to a ?agent= query parameter when the URL has no {name} placeholder", () =>
+    Effect.gen(function* () {
+      const { server, url } = yield* Effect.promise(startMockBroker);
+      yield* Effect.addFinalizer(() => Effect.sync(() => server.close()));
+
+      const { shape: workspaceClient } = yield* makeFakeWorkspaceClient();
+      const adapter = yield* makeWorkspaceTestAdapter(url, workspaceClient);
+      const connectionFiber = yield* forkConnectionWaitWithUrl(server);
+
+      const threadId = ThreadId.make("agentrelay-workspace-query-fallback");
+      yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+      const connection = yield* Fiber.join(connectionFiber);
+
+      assert.equal(connection.url, "/?agent=t3code-agentrelay-workspace-query-fallback");
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rejects starting a new thread with no workspace client configured", () =>
+    Effect.gen(function* () {
+      const adapter = yield* makeWorkspaceTestAdapter("ws://127.0.0.1:1/ws", undefined);
+      const threadId = ThreadId.make("agentrelay-workspace-missing-client");
       const failure = yield* adapter
         .startSession({ threadId, runtimeMode: "full-access" })
         .pipe(Effect.flip);

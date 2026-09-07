@@ -766,9 +766,39 @@ export type OpenCodeSettings = typeof OpenCodeSettings.Type;
  * Agent Relay is unlike every other built-in driver: it does not spawn or
  * own a local subprocess. It attaches over WebSocket to an already-running
  * agent managed by a separate Agent Relay broker process. There is no
- * binary path and no local login flow — credentials are the broker URL and
- * API key the user copies out of the Agent Relay CLI.
+ * binary path and no local login flow.
+ *
+ * Two modes share this one schema, the same way `AntigravitySettings.authMethod`
+ * keeps every method's fields flat instead of branching the struct:
+ *
+ * - `single` (default, legacy v1): the broker URL and API key identify one
+ *   already-running agent directly. Nothing to discover or spawn.
+ * - `workspace`: `workspaceKey` is a Relaycast workspace key (`rk_live_...`)
+ *   used to list and spawn agents in that workspace. The broker URL and API
+ *   key are still required in this mode — they are a *separate* credential
+ *   domain (the local `agent-relay-broker`'s own PTY attach API, not
+ *   Relaycast) that nothing in Agent Relay's MCP/SDK surface currently
+ *   derives from a workspace key. See `docs/internals/providers.md`.
  */
+export const AGENT_RELAY_MODES = [
+  { value: "single", label: "Single agent (manual)" },
+  { value: "workspace", label: "Workspace (auto-discover and spawn)" },
+] as const satisfies ReadonlyArray<ProviderSettingsFormOption>;
+export const AgentRelayMode = Schema.Literals(AGENT_RELAY_MODES.map((mode) => mode.value));
+export type AgentRelayMode = typeof AgentRelayMode.Type;
+
+export const AGENT_RELAY_SPAWN_CLIS = [
+  { value: "claude", label: "Claude Code" },
+  { value: "codex", label: "Codex" },
+  { value: "gemini", label: "Gemini" },
+  { value: "aider", label: "Aider" },
+  { value: "goose", label: "Goose" },
+  { value: "grok", label: "Grok" },
+  { value: "opencode", label: "OpenCode" },
+] as const satisfies ReadonlyArray<ProviderSettingsFormOption>;
+export const AgentRelaySpawnCli = Schema.Literals(AGENT_RELAY_SPAWN_CLIS.map((cli) => cli.value));
+export type AgentRelaySpawnCli = typeof AgentRelaySpawnCli.Type;
+
 export const AgentRelaySettings = makeProviderSettingsSchema(
   {
     // Off by default like Cursor, Grok, and OpenCode: this driver needs a
@@ -777,12 +807,38 @@ export const AgentRelaySettings = makeProviderSettingsSchema(
       Schema.withDecodingDefault(Effect.succeed(false)),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
+    mode: AgentRelayMode.pipe(
+      Schema.withDecodingDefault(Effect.succeed("single" as const)),
+      Schema.annotateKey({
+        title: "Mode",
+        description:
+          "Single agent attaches to the one agent identified below. Workspace discovers every agent in the workspace and spawns new ones for new threads.",
+        providerSettingsForm: {
+          control: "select",
+          options: AGENT_RELAY_MODES,
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    workspaceKey: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Workspace key",
+        description:
+          "Relaycast workspace key (rk_live_...) used to list and spawn agents. Only used in Workspace mode. Stored in plain text on this environment.",
+        providerSettingsForm: {
+          control: "password",
+          placeholder: "rk_live_...",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
     brokerUrl: TrimmedString.pipe(
       Schema.withDecodingDefault(Effect.succeed("")),
       Schema.annotateKey({
         title: "Broker URL",
         description:
-          "WebSocket URL for the Agent Relay broker control plane, from the Agent Relay CLI.",
+          "WebSocket URL for the Agent Relay broker control plane, from the Agent Relay CLI. In Workspace mode, include a literal {name} placeholder that T3 Code substitutes with the resolved agent name (falls back to appending ?agent=<name> when omitted).",
         providerSettingsForm: {
           placeholder: "wss://broker.example.com/ws",
           clearWhenEmpty: "omit",
@@ -802,13 +858,26 @@ export const AgentRelaySettings = makeProviderSettingsSchema(
         },
       }),
     ),
+    defaultSpawnCli: AgentRelaySpawnCli.pipe(
+      Schema.withDecodingDefault(Effect.succeed("claude" as const)),
+      Schema.annotateKey({
+        title: "Spawn CLI",
+        description:
+          "CLI Agent Relay launches when a new thread on this instance has no agent to attach to yet. Only used in Workspace mode.",
+        providerSettingsForm: {
+          control: "select",
+          options: AGENT_RELAY_SPAWN_CLIS,
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
     customModels: Schema.Array(CustomModelSetting).pipe(
       Schema.withDecodingDefault(Effect.succeed([])),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
   {
-    order: ["brokerUrl", "apiKey"],
+    order: ["mode", "workspaceKey", "brokerUrl", "apiKey", "defaultSpawnCli"],
   },
 );
 export type AgentRelaySettings = typeof AgentRelaySettings.Type;

@@ -11,9 +11,9 @@ There are two modes.
 
 Point T3 Code at an Agent Relay workspace once, and every agent already running
 there — however it was spawned (Agent Relay's CLI, its MCP tools, a fleet trigger,
-or an earlier T3 Code thread) — is available to attach to. Starting a **new**
-thread on this instance spawns a fresh agent through Agent Relay instead of
-requiring one to already exist.
+or an earlier T3 Code thread) — shows up as a thread automatically, not just the
+ones you started from T3 Code. Starting a **new** thread on this instance spawns
+a fresh agent through Agent Relay instead of requiring one to already exist.
 
 In **Settings → Providers**, add an Agent Relay instance, set **Mode** to
 **Workspace**, and enter:
@@ -37,6 +37,13 @@ broker.
 Starting a thread that already has an agent bound to it (including one it spawned
 itself in a previous session) reconnects to that same agent rather than spawning
 another.
+
+New agents in the workspace appear as threads within about 30 seconds of coming
+online, each named after the agent and pre-attached — open one and it connects
+immediately, the same as any other thread. If an agent stops running, its
+thread settles automatically after a couple of minutes rather than sitting
+there looking live forever; sending it a new message brings it back if the
+agent returns.
 
 ### Two different credentials
 

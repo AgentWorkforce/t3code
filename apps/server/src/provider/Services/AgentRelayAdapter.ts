@@ -9,8 +9,22 @@
  */
 import type { ProviderAdapterError } from "../Errors.ts";
 import type { ProviderAdapterShape } from "./ProviderAdapter.ts";
+import type { AgentRelayWorkspaceClientShape } from "./AgentRelayWorkspaceClient.ts";
 
 /**
  * AgentRelayAdapterShape — per-instance Agent Relay adapter contract.
  */
-export interface AgentRelayAdapterShape extends ProviderAdapterShape<ProviderAdapterError> {}
+export interface AgentRelayAdapterShape extends ProviderAdapterShape<ProviderAdapterError> {
+  /**
+   * Present only when this instance is configured in Workspace mode (a
+   * `AgentRelayWorkspaceClient` was supplied to `makeAgentRelayAdapter`).
+   * `undefined` in Single mode, where there is nothing to discover.
+   *
+   * Exposed here (rather than reaching for a second, independently
+   * constructed `AgentRelayWorkspaceClient`) so
+   * `AgentRelayThreadDiscoveryReactor` reuses this instance's already-live
+   * client instead of registering a second presence identity for the same
+   * workspace.
+   */
+  readonly listWorkspaceAgents?: AgentRelayWorkspaceClientShape["listAgents"];
+}

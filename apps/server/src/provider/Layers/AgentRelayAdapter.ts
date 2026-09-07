@@ -97,9 +97,14 @@ const AGENT_SPAWN_POLL_INTERVAL = Duration.seconds(2);
 /** Durable per-thread continuation state for workspace mode, round-tripped
  * through `ProviderSession.resumeCursor` / `ProviderSessionDirectory` the
  * same way `CodexResumeCursorSchema` persists a rollout id. Absent (or
- * invalid) means "no agent bound to this thread yet — spawn one". */
-const AgentRelayResumeCursorSchema = Schema.Struct({ agentName: Schema.String });
-const isAgentRelayResumeCursor = Schema.is(AgentRelayResumeCursorSchema);
+ * invalid) means "no agent bound to this thread yet — spawn one".
+ *
+ * Exported for `AgentRelayThreadDiscoveryReactor`, which scans persisted
+ * bindings to tell whether an agent already has a thread before
+ * materializing one for it — the same "which field carries the attach
+ * signal" question `startSession` answers below. */
+export const AgentRelayResumeCursorSchema = Schema.Struct({ agentName: Schema.String });
+export const isAgentRelayResumeCursor = Schema.is(AgentRelayResumeCursorSchema);
 
 /** `https://broker.example.com` -> `wss://broker.example.com/ws`. */
 function toWsUrl(brokerBaseUrl: string): string {
@@ -783,6 +788,9 @@ export function makeAgentRelayAdapter(
       rollbackThread,
       stopAll,
       streamEvents,
+      ...(options?.workspaceClient
+        ? { listWorkspaceAgents: options.workspaceClient.listAgents }
+        : {}),
     } satisfies AgentRelayAdapterShape;
   });
 }

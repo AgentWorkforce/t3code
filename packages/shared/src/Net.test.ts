@@ -81,6 +81,19 @@ it.layer(NetService.layer)("NetService", (it) => {
       }),
     );
 
+    it.effect("canListenOnHost never blocks on ::1, with or without IPv6 support", () =>
+      Effect.gen(function* () {
+        // Regression: a sandboxed/containerized host with no IPv6 stack at
+        // all raises EAFNOSUPPORT binding ::1, not EADDRNOTAVAIL — dev
+        // startup must tolerate both, since neither means the port is
+        // actually taken. Port 0 (ephemeral) so this passes identically on
+        // a host that does have working IPv6.
+        const net = yield* NetService.NetService;
+        const available = yield* net.canListenOnHost(0, "::1");
+        assert.equal(available, true);
+      }),
+    );
+
     it.effect("findAvailablePort falls back when a wildcard listener occupies IPv4", () =>
       Effect.acquireUseRelease(
         openServer("0.0.0.0"),

@@ -23,6 +23,7 @@ import {
   buildInitialAgentRelayProviderSnapshot,
   checkAgentRelayProviderStatus,
 } from "../Layers/AgentRelayProvider.ts";
+import { makeAgentRelayWorkspaceClient } from "../Layers/AgentRelayWorkspaceClientLive.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
   defaultProviderContinuationIdentity,
@@ -70,7 +71,16 @@ export const AgentRelayDriver: ProviderDriver<AgentRelaySettings, AgentRelayDriv
       });
       const effectiveConfig = { ...config, enabled } satisfies AgentRelaySettings;
 
-      const adapter = yield* makeAgentRelayAdapter(effectiveConfig, { instanceId });
+      // Workspace mode discovers/spawns agents through a Relaycast workspace
+      // key; single mode attaches directly and has no use for this client.
+      const workspaceClient =
+        effectiveConfig.mode === "workspace" && effectiveConfig.workspaceKey.trim()
+          ? yield* makeAgentRelayWorkspaceClient(effectiveConfig.workspaceKey, instanceId)
+          : undefined;
+      const adapter = yield* makeAgentRelayAdapter(effectiveConfig, {
+        instanceId,
+        ...(workspaceClient ? { workspaceClient } : {}),
+      });
       const textGeneration = yield* makeAgentRelayTextGeneration;
 
       const checkProvider = checkAgentRelayProviderStatus(effectiveConfig).pipe(

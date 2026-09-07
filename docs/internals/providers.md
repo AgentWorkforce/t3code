@@ -57,6 +57,83 @@ events — turn completion is inferred from the terminal going quiet
 heuristic and add real approvals, but only two Agent Relay harnesses speak it
 natively today; adopting it is a distinct v2 adapter, not a v1 extension.
 
+### Workspace mode: two credential domains that do not bridge today
+
+`AgentRelaySettings.mode` adds a second shape (`"workspace"`) alongside the
+original single-agent mode, following `AntigravitySettings.authMethod`'s
+flat-struct-with-a-selector pattern rather than a schema union. In workspace mode,
+[`AgentRelayAdapter.startSession`](../../apps/server/src/provider/Layers/AgentRelayAdapter.ts)
+spawns an agent for a thread that has none yet (via `AgentRelayWorkspaceClient`,
+[`Live`](../../apps/server/src/provider/Layers/AgentRelayWorkspaceClientLive.ts)),
+waits for it to report online, and persists the resolved agent name as the thread's
+`ProviderSession.resumeCursor` — the same mechanism `CodexSessionRuntime.ts` uses to
+persist a rollout id — so reconnects and restarts attach to the same agent instead
+of spawning a new one every time.
+
+This was built against a concrete finding from reading Agent Relay's own source
+(`agent-relay-mcp.ts`, `local-agent.ts`, `harness-driver/src/transport.ts`,
+`sdk/src/agent-relay.ts`): **there is no existing, non-interactive way to derive a
+write-capable broker attach credential from a workspace key.** They are two
+separate systems:
+
+- `list_agents`/`add_agent` (and the `AgentRelay` SDK facade behind them) talk to
+  the hosted **Relaycast** workspace — a messaging/identity control plane, scoped
+  by a `rk_live_...` workspace key. Spawning specifically goes through the raw
+  pass-through thin client (`createWorkspaceClient` in
+  `@agent-relay/sdk/messaging`, the same one `agent-relay-mcp.ts`'s `getRelay()`
+  returns) — the nicer typed `AgentRelay#agents` facade omits `spawn` entirely.
+  Neither surface's agent/node records (`RelayAgent`, `RelayNode`) carry a broker
+  URL or API key.
+- The actual PTY attach (`HarnessDriverClient`/`BrokerTransport` in
+  `@agent-relay/harness-driver`) is a *different* credential: the local
+  `agent-relay-broker` process's own `X-API-Key`-authenticated HTTP/WS API
+  (`/ws`, `/api/input/{name}/stream`), resolved by the CLI's `attach` command from
+  `--broker-url`/`--api-key`, `RELAY_BROKER_URL`/`RELAY_BROKER_API_KEY`, or
+  `connection.json` — never from a workspace key. (Relay's own tracked gap here is
+  issue #1382, "attach pairs broker URL/key from different sources".)
+
+So workspace mode still asks for both a workspace key (discovery/spawn) *and* a
+broker URL/API key (attach) — it cannot derive one from the other. If Agent Relay
+ever adds a workspace-key-derivable attach credential (a `brokerUrl`/`apiKey` on
+`RelayAgent`/`RelayNode`, or a new MCP tool), that field is exactly what should
+replace the second credential here.
+
+A second, narrower gap: the real per-agent attach protocol
+(`harness-driver/src/transport.ts`) is a **two-channel**, ack/keepalive-based
+protocol (`GET/PUT .../delivery-mode`, a shared `/ws?sinceSeq=` event stream
+multiplexed by agent `name`, and a separate `/api/input/{name}/stream` for
+writes with `pty_input_ready`/`pty_input_ack` flow control) — nothing like the v1
+adapter's single bidirectional `worker_stream`/`sendInput` socket. Reproducing
+that protocol is out of scope here for the same reason the v1 wire-format gap
+above is: it is a distinct v2 adapter. Workspace mode's `brokerUrl` setting is
+therefore a T3-Code-side convention layered on the *existing* v1 guess — a
+`{name}` placeholder (or a `?agent=<name>` fallback) substituted by
+`buildWorkspaceAttachUrl` — not a real Agent Relay contract. Whoever builds the v2
+adapter should replace both the frame format and this URL convention together
+against `harness-driver`'s real transport.
+
+Presence (used to detect a freshly-spawned agent coming online, and to notice one
+going offline) uses `AgentRelay#addListener("agent.status.*", ...)` — the one
+wildcard-typed selector confirmed in `packages/sdk/src/listeners.ts`. This could
+not be verified end-to-end against a live workspace, so `waitForAgentOnline`
+races it against polling `listAgents()` every two seconds (bounded by
+`AGENT_SPAWN_WAIT_TIMEOUT`, 90s); polling alone is sufficient for correctness.
+
+### Left out: auto-materializing threads for already-running agents
+
+`AgentRelayWorkspaceClient` can already list every agent in a workspace and watch
+presence, which is the primitive auto-discovery (surfacing an agent nobody started
+from T3 Code as a thread) needs. What it does not do is turn that into a thread:
+`thread.create` (`apps/server/src/orchestration/decider.ts`) requires a
+`projectId`, and every existing thread-creation path is a deliberate user action.
+Silently materializing a thread per discovered agent needs a product decision this
+change does not make on its own — at minimum, which project houses them and
+whether every agent in a workspace should really become a thread unasked. A
+follow-up background reactor (shaped like
+`apps/server/src/provider/Layers/ProviderSessionReaper.ts`) is the right place to
+wire `AgentRelayWorkspaceClient.listAgents`/`onPresenceChange` into `thread.create`
+dispatch once that's decided.
+
 ## Setup must not happen as a health-check side effect
 
 Opening a provider session can start MCP servers, run hooks, or launch a login browser.

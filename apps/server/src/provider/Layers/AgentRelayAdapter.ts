@@ -18,6 +18,13 @@
  * `{ type: "sendInput", data: string }` out). If the real broker's frames
  * differ, only these two functions need to change.
  *
+ * Workspace mode: when `agentRelaySettings.mode === "workspace"`, a thread
+ * with no agent bound to it yet spawns one through `workspaceClient` and
+ * waits for it to come online (see `waitForAgentOnline`) before
+ * connecting — everything from `connect()` down is untouched, reused exactly
+ * as v1 built it. See `docs/internals/providers.md` for the credential and
+ * wire-format caveats that come with this.
+ *
  * @module AgentRelayAdapterLive
  */
 import {
@@ -36,8 +43,10 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import WebSocket from "ws";
@@ -48,6 +57,7 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import { type AgentRelayAdapterShape } from "../Services/AgentRelayAdapter.ts";
+import type { AgentRelayWorkspaceClientShape } from "../Services/AgentRelayWorkspaceClient.ts";
 
 const PROVIDER = ProviderDriverKind.make("agentrelay");
 
@@ -61,16 +71,108 @@ const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 // see the "protocol traps" note in docs/internals/providers.md.
 const TURN_IDLE_COMPLETE_MS = 1_500;
 
+// How long to wait for a freshly-spawned agent to report itself online (via
+// `workspaceClient.onPresenceChange`, raced against polling `listAgents`)
+// before giving up. Agent Relay's own `add_agent` MCP tool documents spawns
+// as fire-and-forget, so this has to be generous — CLI installs and cold
+// starts are not instant.
+const AGENT_SPAWN_WAIT_TIMEOUT = Duration.seconds(90);
+const AGENT_SPAWN_POLL_INTERVAL = Duration.seconds(2);
+
+/** Durable per-thread continuation state for workspace mode, round-tripped
+ * through `ProviderSession.resumeCursor` / `ProviderSessionDirectory` the
+ * same way `CodexResumeCursorSchema` persists a rollout id. Absent (or
+ * invalid) means "no agent bound to this thread yet — spawn one". */
+const AgentRelayResumeCursorSchema = Schema.Struct({ agentName: Schema.String });
+const isAgentRelayResumeCursor = Schema.is(AgentRelayResumeCursorSchema);
+
+const AGENT_NAME_PLACEHOLDER = "{name}";
+
+/**
+ * Workspace mode has no real per-agent attach endpoint to build this from
+ * (see `docs/internals/providers.md`), so this is a T3-Code-side convention
+ * layered on top of the same placeholder `brokerUrl` setting single mode
+ * already uses verbatim: substitute a literal `{name}` placeholder when
+ * present, otherwise append `?agent=<name>`.
+ */
+function buildWorkspaceAttachUrl(brokerUrlTemplate: string, agentName: string): string {
+  if (brokerUrlTemplate.includes(AGENT_NAME_PLACEHOLDER)) {
+    return brokerUrlTemplate.split(AGENT_NAME_PLACEHOLDER).join(encodeURIComponent(agentName));
+  }
+  const separator = brokerUrlTemplate.includes("?") ? "&" : "?";
+  return `${brokerUrlTemplate}${separator}agent=${encodeURIComponent(agentName)}`;
+}
+
+/** Derive a valid, deterministic Relaycast agent name for a thread's spawn,
+ * so retrying `startSession` on the same thread (before a resume cursor is
+ * persisted) asks for the same name instead of leaking one per attempt. */
+function spawnAgentNameForThread(threadId: ThreadId): string {
+  const slug = String(threadId)
+    .replace(/[^a-zA-Z0-9_-]/g, "-")
+    .slice(0, 40);
+  return `t3code-${slug}`;
+}
+
+/**
+ * Waits for `name` to report online, racing a live presence subscription
+ * against polling `listAgents` — belt and suspenders, since this module
+ * could not confirm from static reading alone that Agent Relay's presence
+ * events reach `workspaceClient.onPresenceChange` for every workspace (see
+ * `AgentRelayWorkspaceClientLive.ts`). Polling alone is sufficient for
+ * correctness; the subscription only makes the common case faster.
+ */
+function waitForAgentOnline(
+  workspaceClient: AgentRelayWorkspaceClientShape,
+  name: string,
+): Effect.Effect<void, ProviderAdapterRequestError> {
+  const awaitPresenceEvent = Effect.callback<void>((resume) => {
+    const unsubscribe = workspaceClient.onPresenceChange((eventName, status) => {
+      if (eventName === name && status === "online") resume(Effect.void);
+    });
+    return Effect.sync(unsubscribe);
+  });
+
+  const pollUntilOnline = Effect.gen(function* () {
+    while (true) {
+      const agents = yield* workspaceClient.listAgents().pipe(Effect.orElseSucceed(() => []));
+      if (agents.some((agent) => agent.name === name && agent.status === "online")) return;
+      yield* Effect.sleep(AGENT_SPAWN_POLL_INTERVAL);
+    }
+  });
+
+  return Effect.race(awaitPresenceEvent, pollUntilOnline).pipe(
+    Effect.timeoutOption(AGENT_SPAWN_WAIT_TIMEOUT),
+    Effect.flatMap((result) =>
+      Option.isSome(result)
+        ? Effect.void
+        : new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "startSession",
+            detail: `Agent Relay did not report '${name}' online within ${Duration.toSeconds(AGENT_SPAWN_WAIT_TIMEOUT)}s of spawning it. The spawn may still be starting up — try sending another message to retry the attach.`,
+          }),
+    ),
+  );
+}
+
 export interface AgentRelayAdapterLiveOptions {
   /** Selections are honored when routed to this instance id. Defaults to
    * the legacy built-in instance id (`agentrelay`). */
   readonly instanceId?: ProviderInstanceId;
+  /** Required (and only used) when `agentRelaySettings.mode === "workspace"`:
+   * discovers and spawns agents in the configured Relaycast workspace. */
+  readonly workspaceClient?: AgentRelayWorkspaceClientShape;
 }
 
 interface AgentRelaySessionContext {
   readonly threadId: ThreadId;
   session: ProviderSession;
   readonly scope: Scope.Closeable;
+  /** Resolved connection URL for this thread's session. Equal to
+   * `agentRelaySettings.brokerUrl` in single mode; in workspace mode, the
+   * template with the resolved agent name substituted in
+   * (`buildWorkspaceAttachUrl`). Fixed for the life of the session, so
+   * reconnects keep attaching to the same agent. */
+  readonly wsUrl: string;
   socket: WebSocket | undefined;
   reconnectAttempt: number;
   activeTurnId: TurnId | undefined;
@@ -330,10 +432,10 @@ export function makeAgentRelayAdapter(
       let socket: WebSocket;
       try {
         socket = apiKey
-          ? new WebSocket(agentRelaySettings.brokerUrl, {
+          ? new WebSocket(ctx.wsUrl, {
               headers: { authorization: `Bearer ${apiKey}` },
             })
-          : new WebSocket(agentRelaySettings.brokerUrl);
+          : new WebSocket(ctx.wsUrl);
       } catch (cause) {
         dispatch(handleConnectFailure(ctx, describeError(cause)));
         return;
@@ -390,6 +492,54 @@ export function makeAgentRelayAdapter(
           });
         }
 
+        // Workspace mode: resolve which agent this thread attaches to. A
+        // resume cursor from a prior `startSession` on this thread means an
+        // agent is already bound — reconnect to that same one. No cursor
+        // means this is the thread's first session: spawn a fresh agent and
+        // wait for it to come online before attaching, so a brand-new
+        // Agent Relay thread never requires a pre-existing target the way
+        // v1 did.
+        let targetAgentName: string | undefined;
+        if (agentRelaySettings.mode === "workspace") {
+          if (isAgentRelayResumeCursor(input.resumeCursor)) {
+            targetAgentName = input.resumeCursor.agentName;
+          } else {
+            const workspaceClient = options?.workspaceClient;
+            if (!workspaceClient) {
+              return yield* new ProviderAdapterValidationError({
+                provider: PROVIDER,
+                operation: "startSession",
+                issue:
+                  "Agent Relay is in Workspace mode but no workspace key is configured for this instance.",
+              });
+            }
+            const requestedName = spawnAgentNameForThread(input.threadId);
+            const spawned = yield* workspaceClient
+              .spawnAgent({
+                name: requestedName,
+                cli: agentRelaySettings.defaultSpawnCli,
+                ...(input.title ? { task: input.title } : {}),
+              })
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapterRequestError({
+                      provider: PROVIDER,
+                      method: "startSession",
+                      detail: `Failed to spawn an Agent Relay worker '${requestedName}': ${cause.detail}`,
+                      cause,
+                    }),
+                ),
+              );
+            yield* waitForAgentOnline(workspaceClient, spawned.name);
+            targetAgentName = spawned.name;
+          }
+        }
+        const wsUrl =
+          targetAgentName !== undefined
+            ? buildWorkspaceAttachUrl(agentRelaySettings.brokerUrl, targetAgentName)
+            : agentRelaySettings.brokerUrl;
+
         const existing = sessions.get(input.threadId);
         if (existing) {
           yield* stopSessionInternal(existing);
@@ -405,6 +555,9 @@ export function makeAgentRelayAdapter(
           runtimeMode: input.runtimeMode,
           ...(input.cwd ? { cwd: input.cwd } : {}),
           threadId: input.threadId,
+          ...(targetAgentName !== undefined
+            ? { resumeCursor: { agentName: targetAgentName } }
+            : {}),
           createdAt: now,
           updatedAt: now,
         };
@@ -412,6 +565,7 @@ export function makeAgentRelayAdapter(
           threadId: input.threadId,
           session,
           scope,
+          wsUrl,
           socket: undefined,
           reconnectAttempt: 0,
           activeTurnId: undefined,

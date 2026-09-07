@@ -60,9 +60,12 @@ import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as SynchronizedRef from "effect/SynchronizedRef";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 import WebSocket from "ws";
 
@@ -86,6 +89,18 @@ const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 // see the "protocol traps" note in docs/internals/providers.md.
 const TURN_IDLE_COMPLETE_MS = 1_500;
 
+// The idle-quiet heuristic above only makes sense once the agent has
+// actually started responding. Starting that 1.5s countdown immediately
+// after `postInput` (the original behavior) settled the turn during
+// ordinary startup latency — broker round-trip, agent cold start — before
+// any output existed, so a slightly slow agent had its turn marked
+// "completed" while still working, and every frame after that arrived with
+// no active turn to attach to. This bounds how long the watchdog waits for
+// the *first* frame before falling back to the same idle-complete behavior
+// as before; it is deliberately far more generous than the between-frames
+// quiet window above.
+const TURN_FIRST_ACTIVITY_TIMEOUT_MS = 30_000;
+
 // How long to wait for a freshly-spawned agent to report itself online (via
 // `workspaceClient.onPresenceChange`, raced against polling `listAgents`)
 // before giving up. Agent Relay's own `add_agent` MCP tool documents spawns
@@ -103,6 +118,10 @@ const AGENT_SPAWN_POLL_INTERVAL = Duration.seconds(2);
 // message reliably losing this race and erroring out.
 const CONNECT_WAIT_TIMEOUT = Duration.seconds(15);
 const CONNECT_POLL_INTERVAL = Duration.millis(50);
+
+// `ctx.turns` retains this many most-recent entries per session — see
+// `sendTurn`'s trim comment for why an unbounded history isn't needed here.
+const MAX_RETAINED_TURNS = 50;
 
 /** Durable per-thread continuation state for workspace mode, round-tripped
  * through `ProviderSession.resumeCursor` / `ProviderSessionDirectory` the
@@ -189,7 +208,10 @@ function awaitSessionConnected(
   ctx: AgentRelaySessionContext,
 ): Effect.Effect<void, ProviderAdapterRequestError> {
   const pollUntilSettled = Effect.gen(function* () {
-    while (ctx.session.status === "connecting") {
+    // `ctx.stopped` also exits the wait: a session stopped mid-connect
+    // (e.g. `stopSession` racing a still-connecting `sendTurn`) should fail
+    // fast on the next status check instead of polling until the timeout.
+    while (ctx.session.status === "connecting" && !ctx.stopped) {
       yield* Effect.sleep(CONNECT_POLL_INTERVAL);
     }
   });
@@ -270,6 +292,7 @@ export function makeAgentRelayAdapter(
     const httpClient = yield* HttpClient.HttpClient;
 
     const sessions = new Map<ThreadId, AgentRelaySessionContext>();
+    const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -301,6 +324,28 @@ export function makeAgentRelayAdapter(
         ),
       );
     };
+
+    // Serializes `startSession` per thread — see its call site for why:
+    // spawning/waiting-online and installing the session context both
+    // happen inside the lock, matching `CursorAdapter`'s pattern.
+    const getThreadSemaphore = (threadId: string) =>
+      SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
+        const existing = Option.fromNullishOr(current.get(threadId));
+        return Option.match(existing, {
+          onNone: () =>
+            Semaphore.make(1).pipe(
+              Effect.map((semaphore) => {
+                const next = new Map(current);
+                next.set(threadId, semaphore);
+                return [semaphore, next] as const;
+              }),
+            ),
+          onSome: (semaphore) => Effect.succeed([semaphore, current] as const),
+        });
+      });
+
+    const withThreadLock = <A, E, R>(threadId: string, effect: Effect.Effect<A, E, R>) =>
+      Effect.flatMap(getThreadSemaphore(threadId), (semaphore) => semaphore.withPermit(effect));
 
     const requireSession = (
       threadId: ThreadId,
@@ -356,8 +401,15 @@ export function makeAgentRelayAdapter(
         // the watchdog before it calls this.
         ctx.turnWatchdogFiber = undefined;
         const updatedAt = yield* nowIso;
-        const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
-        ctx.session = { ...readySession, status: "ready", updatedAt };
+        const { activeTurnId: _activeTurnId, ...rest } = ctx.session;
+        // Preserve "error" rather than unconditionally restoring "ready":
+        // a disconnect during this turn (`handleClose`) already set status
+        // to "error" and cleared `ctx.socket`. Without this check, this
+        // watchdog-driven completion would resurrect the session to
+        // "ready" with no socket to serve it — `sendTurn` would then
+        // accept a next message it can never actually deliver.
+        const status = ctx.session.status === "error" ? "error" : "ready";
+        ctx.session = { ...rest, status, updatedAt };
         yield* offerRuntimeEvent({
           type: "turn.completed",
           ...(yield* makeEventStamp()),
@@ -373,6 +425,15 @@ export function makeAgentRelayAdapter(
       turnId: TurnId,
     ): Effect.Effect<void> =>
       Effect.gen(function* () {
+        // Wait for the first sign of activity before starting the
+        // idle-quiet countdown — see `TURN_FIRST_ACTIVITY_TIMEOUT_MS`'s
+        // comment. If nothing ever arrives within that bound, fall through
+        // to the same idle-complete behavior the loop below applies
+        // between frames, rather than hanging forever.
+        yield* Effect.raceFirst(
+          Queue.take(ctx.activitySignals),
+          Effect.sleep(Duration.millis(TURN_FIRST_ACTIVITY_TIMEOUT_MS)),
+        );
         while (ctx.activeTurnId === turnId) {
           const woke = yield* Effect.raceFirst(
             Effect.sleep(Duration.millis(TURN_IDLE_COMPLETE_MS)).pipe(
@@ -446,15 +507,20 @@ export function makeAgentRelayAdapter(
     const handleClose = (ctx: AgentRelaySessionContext, code: number, reason: string) =>
       Effect.gen(function* () {
         const liveCtx = sessions.get(ctx.threadId);
+        // `ctx.stopped` is the authoritative "we asked for this" signal:
+        // `stopSessionInternal` sets it synchronously before ever calling
+        // `socket.close()`, so by the time this handler's "close" event
+        // fires for our own intentional close, this guard has already
+        // returned. Reaching past it therefore means the *other* side
+        // closed the socket — including a clean code 1000, which `ws`
+        // servers send for perfectly ordinary reasons (a broker restart,
+        // for instance). Treating every 1000 as deliberate (the previous
+        // behavior) tore the session down and permanently skipped the
+        // reconnect/backoff loop below on exactly the closes it exists
+        // for. Every non-local close now goes through the same
+        // error-then-reconnect path regardless of code.
         if (liveCtx !== ctx || ctx.stopped) return;
         ctx.socket = undefined;
-        // 1000 is a normal close either side can initiate — `stopSession`
-        // closes with this code, so treat it as a deliberate disconnect
-        // rather than something to reconnect from.
-        if (code === 1000) {
-          yield* stopSessionInternal(ctx);
-          return;
-        }
         const detail = reason.trim() || `Broker connection closed (code ${code}).`;
         const updatedAt = yield* nowIso;
         ctx.session = { ...ctx.session, status: "error", updatedAt, lastError: detail };
@@ -465,6 +531,20 @@ export function makeAgentRelayAdapter(
           threadId: ctx.threadId,
           payload: { state: "error", reason: detail },
         });
+        // Abort any in-flight turn now instead of leaving it to the idle
+        // watchdog: with no socket, nothing will ever deliver its output,
+        // and (per `completeActiveTurn`'s status guard above) letting the
+        // watchdog's own timeout fire later would just complete the turn
+        // against a session already marked "error".
+        const turnId = ctx.activeTurnId;
+        if (turnId !== undefined) {
+          const watchdog = ctx.turnWatchdogFiber;
+          ctx.turnWatchdogFiber = undefined;
+          if (watchdog) {
+            yield* Fiber.interrupt(watchdog);
+          }
+          yield* completeActiveTurn(ctx, turnId, "cancelled");
+        }
         yield* scheduleReconnect(ctx);
       });
 
@@ -545,132 +625,155 @@ export function makeAgentRelayAdapter(
       });
 
     const startSession: AgentRelayAdapterShape["startSession"] = (input) =>
-      Effect.gen(function* () {
-        if (input.provider !== undefined && input.provider !== PROVIDER) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "startSession",
-            issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
-          });
-        }
-        if (!agentRelaySettings.brokerUrl.trim()) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "startSession",
-            issue: "Agent Relay broker URL is not configured for this instance.",
-          });
-        }
+      // Serialized per thread: without this, two overlapping `startSession`
+      // calls for the same thread (e.g. a duplicate client request) could
+      // both observe no existing context, both spawn/wait in Workspace
+      // mode, and race to install their own `ctx` into `sessions` — the
+      // loser's socket and workspace agent are then orphaned instead of
+      // torn down. Matches `CursorAdapter`'s `withThreadLock`.
+      withThreadLock(
+        input.threadId,
+        Effect.gen(function* () {
+          if (input.provider !== undefined && input.provider !== PROVIDER) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "startSession",
+              issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
+            });
+          }
+          if (!agentRelaySettings.brokerUrl.trim()) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "startSession",
+              issue: "Agent Relay broker URL is not configured for this instance.",
+            });
+          }
 
-        // Resolve which agent this thread attaches to. Single mode always
-        // targets the one configured `agentName`. Workspace mode: a resume
-        // cursor from a prior `startSession` on this thread means an agent
-        // is already bound — reconnect to that same one; no cursor means
-        // this is the thread's first session, so spawn a fresh agent and
-        // wait for it to come online before attaching, so a brand-new
-        // Agent Relay thread never requires a pre-existing target the way
-        // single mode does.
-        let targetAgentName: string;
-        if (agentRelaySettings.mode === "workspace") {
-          if (isAgentRelayResumeCursor(input.resumeCursor)) {
-            targetAgentName = input.resumeCursor.agentName;
+          // Resolve which agent this thread attaches to. Single mode always
+          // targets the one configured `agentName`. Workspace mode: a resume
+          // cursor from a prior `startSession` on this thread means an agent
+          // is already bound — reconnect to that same one; no cursor means
+          // this is the thread's first session, so spawn a fresh agent and
+          // wait for it to come online before attaching, so a brand-new
+          // Agent Relay thread never requires a pre-existing target the way
+          // single mode does.
+          let targetAgentName: string;
+          if (agentRelaySettings.mode === "workspace") {
+            if (isAgentRelayResumeCursor(input.resumeCursor)) {
+              targetAgentName = input.resumeCursor.agentName;
+            } else {
+              const workspaceClient = options?.workspaceClient;
+              if (!workspaceClient) {
+                return yield* new ProviderAdapterValidationError({
+                  provider: PROVIDER,
+                  operation: "startSession",
+                  issue:
+                    "Agent Relay is in Workspace mode but no workspace key is configured for this instance.",
+                });
+              }
+              const requestedName = spawnAgentNameForThread(input.threadId);
+              const spawned = yield* workspaceClient
+                .spawnAgent({
+                  name: requestedName,
+                  cli: agentRelaySettings.defaultSpawnCli,
+                  ...(input.title ? { task: input.title } : {}),
+                })
+                .pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProviderAdapterRequestError({
+                        provider: PROVIDER,
+                        method: "startSession",
+                        detail: `Failed to spawn an Agent Relay worker '${requestedName}': ${cause.detail}`,
+                        cause,
+                      }),
+                  ),
+                );
+              yield* waitForAgentOnline(workspaceClient, spawned.name);
+              targetAgentName = spawned.name;
+            }
           } else {
-            const workspaceClient = options?.workspaceClient;
-            if (!workspaceClient) {
+            const configuredName = agentRelaySettings.agentName.trim();
+            if (!configuredName) {
               return yield* new ProviderAdapterValidationError({
                 provider: PROVIDER,
                 operation: "startSession",
                 issue:
-                  "Agent Relay is in Workspace mode but no workspace key is configured for this instance.",
+                  "Agent Relay Single agent mode requires an agent name: the broker's WebSocket stream carries every worker on it, and T3 Code needs a name to tell them apart.",
               });
             }
-            const requestedName = spawnAgentNameForThread(input.threadId);
-            const spawned = yield* workspaceClient
-              .spawnAgent({
-                name: requestedName,
-                cli: agentRelaySettings.defaultSpawnCli,
-                ...(input.title ? { task: input.title } : {}),
-              })
-              .pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderAdapterRequestError({
-                      provider: PROVIDER,
-                      method: "startSession",
-                      detail: `Failed to spawn an Agent Relay worker '${requestedName}': ${cause.detail}`,
-                      cause,
-                    }),
-                ),
-              );
-            yield* waitForAgentOnline(workspaceClient, spawned.name);
-            targetAgentName = spawned.name;
+            targetAgentName = configuredName;
           }
-        } else {
-          const configuredName = agentRelaySettings.agentName.trim();
-          if (!configuredName) {
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "startSession",
-              issue:
-                "Agent Relay Single agent mode requires an agent name: the broker's WebSocket stream carries every worker on it, and T3 Code needs a name to tell them apart.",
-            });
+          // Strip trailing slashes: `toWsUrl`/`toInputUrl` each append their
+          // own leading `/`, so a URL saved with one (e.g.
+          // "https://broker.example.com/") would otherwise derive "//ws" and
+          // "//api/input/<name>" — the broker's exact-path routing rejects
+          // both.
+          const brokerBaseUrl = agentRelaySettings.brokerUrl.trim().replace(/\/+$/, "");
+
+          const existing = sessions.get(input.threadId);
+          if (existing) {
+            yield* stopSessionInternal(existing);
           }
-          targetAgentName = configuredName;
-        }
-        const brokerBaseUrl = agentRelaySettings.brokerUrl.trim();
 
-        const existing = sessions.get(input.threadId);
-        if (existing) {
-          yield* stopSessionInternal(existing);
-        }
+          const scope = yield* Scope.make();
+          const activitySignals = yield* Queue.sliding<void>(1);
+          const now = yield* nowIso;
+          const session: ProviderSession = {
+            provider: PROVIDER,
+            providerInstanceId: boundInstanceId,
+            status: "connecting",
+            runtimeMode: input.runtimeMode,
+            ...(input.cwd ? { cwd: input.cwd } : {}),
+            threadId: input.threadId,
+            // Only meaningful in Workspace mode, where it's how a later
+            // `startSession` on this thread knows which spawned agent to
+            // reattach to instead of spawning another. Persisting it in
+            // Single mode too meant switching an instance from Single to
+            // Workspace left the old single-mode agent's name behind as a
+            // stale resume cursor — the next Workspace start would skip
+            // spawning and silently attach to that unrelated agent.
+            ...(agentRelaySettings.mode === "workspace"
+              ? { resumeCursor: { agentName: targetAgentName } }
+              : {}),
+            createdAt: now,
+            updatedAt: now,
+          };
+          const ctx: AgentRelaySessionContext = {
+            threadId: input.threadId,
+            session,
+            scope,
+            brokerBaseUrl,
+            agentName: targetAgentName,
+            socket: undefined,
+            reconnectAttempt: 0,
+            activeTurnId: undefined,
+            activitySignals,
+            turnWatchdogFiber: undefined,
+            turns: [],
+            stopped: false,
+          };
+          sessions.set(input.threadId, ctx);
 
-        const scope = yield* Scope.make();
-        const activitySignals = yield* Queue.sliding<void>(1);
-        const now = yield* nowIso;
-        const session: ProviderSession = {
-          provider: PROVIDER,
-          providerInstanceId: boundInstanceId,
-          status: "connecting",
-          runtimeMode: input.runtimeMode,
-          ...(input.cwd ? { cwd: input.cwd } : {}),
-          threadId: input.threadId,
-          resumeCursor: { agentName: targetAgentName },
-          createdAt: now,
-          updatedAt: now,
-        };
-        const ctx: AgentRelaySessionContext = {
-          threadId: input.threadId,
-          session,
-          scope,
-          brokerBaseUrl,
-          agentName: targetAgentName,
-          socket: undefined,
-          reconnectAttempt: 0,
-          activeTurnId: undefined,
-          activitySignals,
-          turnWatchdogFiber: undefined,
-          turns: [],
-          stopped: false,
-        };
-        sessions.set(input.threadId, ctx);
+          yield* offerRuntimeEvent({
+            type: "session.started",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: input.threadId,
+            payload: {},
+          });
+          yield* offerRuntimeEvent({
+            type: "thread.started",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: input.threadId,
+            payload: {},
+          });
 
-        yield* offerRuntimeEvent({
-          type: "session.started",
-          ...(yield* makeEventStamp()),
-          provider: PROVIDER,
-          threadId: input.threadId,
-          payload: {},
-        });
-        yield* offerRuntimeEvent({
-          type: "thread.started",
-          ...(yield* makeEventStamp()),
-          provider: PROVIDER,
-          threadId: input.threadId,
-          payload: {},
-        });
-
-        connect(ctx);
-        return session;
-      });
+          connect(ctx);
+          return session;
+        }),
+      );
 
     const sendTurn: AgentRelayAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
@@ -694,10 +797,20 @@ export function makeAgentRelayAdapter(
               "Turn requires non-empty text. Agent Relay's terminal transport cannot carry attachments.",
           });
         }
-        yield* postInput(ctx, `${text}\n`);
-
+        // Register the turn *before* posting input, not after: `postInput`
+        // is an HTTP round-trip, and the broker can start streaming
+        // `worker_stream` output back over the already-open `/ws` socket
+        // before that POST even resolves. `handleIncomingText` reads
+        // `ctx.activeTurnId` to stamp outgoing `content.delta` events —
+        // registering it only after `postInput` succeeded left a real
+        // window where the first frames of a response arrived with no
+        // active turn, and before `turn.started` had even been published.
         const isNewTurn = ctx.activeTurnId === undefined;
         const turnId = ctx.activeTurnId ?? TurnId.make(yield* randomUUIDv4);
+        const previousActiveTurnId = ctx.activeTurnId;
+        const previousSession = ctx.session;
+        const previousTurnsLength = ctx.turns.length;
+
         ctx.activeTurnId = turnId;
         ctx.turns.push({ id: turnId, items: [{ input: text }] });
         const updatedAt = yield* nowIso;
@@ -719,6 +832,43 @@ export function makeAgentRelayAdapter(
           // Steering an in-flight turn: nudge the watchdog so a user still
           // typing does not race the idle-completion timer.
           yield* Queue.offer(ctx.activitySignals, undefined);
+        }
+
+        const posted = yield* postInput(ctx, `${text}\n`).pipe(Effect.result);
+        if (Result.isFailure(posted)) {
+          // The broker never got this input — undo the registration above
+          // so the session doesn't sit on a permanently "running" turn
+          // nothing will ever complete. `turn.started` already went out to
+          // any subscriber, so tell them it's over too.
+          if (isNewTurn) {
+            const watchdog = ctx.turnWatchdogFiber;
+            ctx.turnWatchdogFiber = undefined;
+            if (watchdog) {
+              yield* Fiber.interrupt(watchdog);
+            }
+            yield* offerRuntimeEvent({
+              type: "turn.aborted",
+              ...(yield* makeEventStamp()),
+              provider: PROVIDER,
+              threadId: input.threadId,
+              turnId,
+              payload: { reason: posted.failure.detail },
+            });
+          }
+          ctx.activeTurnId = previousActiveTurnId;
+          ctx.session = previousSession;
+          ctx.turns.length = previousTurnsLength;
+          return yield* posted.failure;
+        }
+
+        // `rollbackThread` is a no-op here (`supportsConversationRollback`
+        // is false, so orchestration never actually calls it — see its own
+        // comment) and there's no other reader that needs the full
+        // history, only `readThread`'s most-recent view. Without a cap,
+        // `ctx.turns` grows one entry per message for the life of a
+        // session with nothing to ever trim it.
+        if (ctx.turns.length > MAX_RETAINED_TURNS) {
+          ctx.turns.splice(0, ctx.turns.length - MAX_RETAINED_TURNS);
         }
 
         return { threadId: input.threadId, turnId };

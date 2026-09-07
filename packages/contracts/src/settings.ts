@@ -780,9 +780,14 @@ export type OpenCodeSettings = typeof OpenCodeSettings.Type;
  *   Relaycast) that nothing in Agent Relay's MCP/SDK surface currently
  *   derives from a workspace key. See `docs/internals/providers.md`.
  */
+// Order matters beyond readability: `ProviderSettingsForm.tsx`'s select
+// control treats the first entry as the default for a fresh, unconfigured
+// instance (independent of `Schema.withDecodingDefault` below, which only
+// applies when decoding an already-persisted config) — so Workspace must
+// stay first for the Add Provider wizard to actually default to it.
 export const AGENT_RELAY_MODES = [
-  { value: "single", label: "Single agent (manual)" },
   { value: "workspace", label: "Workspace (auto-discover and spawn)" },
+  { value: "single", label: "Single agent (manual)" },
 ] as const satisfies ReadonlyArray<ProviderSettingsFormOption>;
 export const AgentRelayMode = Schema.Literals(AGENT_RELAY_MODES.map((mode) => mode.value));
 export type AgentRelayMode = typeof AgentRelayMode.Type;

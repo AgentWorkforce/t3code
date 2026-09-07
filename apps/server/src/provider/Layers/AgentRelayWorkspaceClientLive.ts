@@ -51,8 +51,7 @@ function describeError(cause: unknown): string {
 function toAgentSummary(agent: RelayAgent): AgentRelayWorkspaceAgentSummary {
   return {
     name: agent.name,
-    status:
-      agent.status === "online" || agent.status === "offline" ? agent.status : "unknown",
+    status: agent.status === "online" || agent.status === "offline" ? agent.status : "unknown",
   };
 }
 
@@ -71,17 +70,26 @@ export function readPresenceTransition(
   if (type === "agentOnline" || type === "agentOffline") {
     const agent = record.agent;
     const name =
-      typeof agent === "object" && agent !== null && typeof (agent as { name?: unknown }).name === "string"
+      typeof agent === "object" &&
+      agent !== null &&
+      typeof (agent as { name?: unknown }).name === "string"
         ? (agent as { name: string }).name
         : undefined;
     if (!name) return undefined;
     return { name, status: type === "agentOnline" ? "online" : "offline" };
   }
-  if (typeof type === "string" && type.startsWith("agent.status.")) {
+  if (type === "agent.status.online" || type === "agent.status.offline") {
     const agentId = record.agentId;
     if (typeof agentId !== "string" || !agentId) return undefined;
-    return { name: agentId, status: type === "agent.status.offline" ? "offline" : "online" };
+    return { name: agentId, status: type === "agent.status.online" ? "online" : "offline" };
   }
+  // Any other `agent.status.*` event (e.g. `connecting`, `error`) is
+  // deliberately ignored rather than defaulted to "online" — this
+  // module's presence uncertainty (see the module doc) cuts both ways:
+  // guessing wrong here can resolve `waitForAgentOnline` for an agent
+  // that isn't actually attachable yet. `AgentRelayAdapter`'s poll-based
+  // fallback still covers every real transition even when this listener
+  // drops one.
   return undefined;
 }
 
@@ -134,7 +142,8 @@ export function makeAgentRelayWorkspaceClient(
 
     const listAgents: AgentRelayWorkspaceClientShape["listAgents"] = (filter) =>
       Effect.tryPromise({
-        try: () => workspaceClient.agents.list(filter?.status ? { status: filter.status } : undefined),
+        try: () =>
+          workspaceClient.agents.list(filter?.status ? { status: filter.status } : undefined),
         catch: (cause) =>
           new ProviderAdapterRequestError({
             provider: PROVIDER,

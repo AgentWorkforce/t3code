@@ -129,3 +129,16 @@ current client support.
 
 Model classification has its own [manifest constraints](./model-manifest.md). Assistant-reference
 handling is documented under [citations](./assistant-citations.md).
+
+## External sessions are visibility only, never a provider adapter
+
+A Claude Code or Codex session started outside T3 Code entirely (a bare `claude`/`codex`
+invocation in a terminal, bypassing Agent Relay too) can only ever produce a settled, read-only
+marker thread ([`ExternalSessionHooks`](../../apps/server/src/project/ExternalSessionHooks.ts)),
+not a live session. T3 Code never spawned the reported process, so unlike every real provider
+adapter there is no PTY, no provider session binding, and no broker to attach to — only a pid, a
+cwd, and a timestamp reported by a global lifecycle hook. This is also why it stays a separate
+mechanism from `AgentSessionImporter`'s resumable transcript import (`import:<provider>:<sessionId>`
+threads carrying a `resumeCursor`): a lifecycle hook reports process existence, never a transcript,
+so there is nothing to resume, and reusing that importer's thread namespace or resume machinery
+would advertise a resume affordance this thread can never honor.

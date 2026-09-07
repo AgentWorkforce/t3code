@@ -35,6 +35,28 @@ client connections and provider-instance rebuilds. Releases are immutable, with 
 selecting the version for new processes. Running processes hold leases on their version. Updates
 and removal must respect those leases instead of replacing executables under a running agent.
 
+## Agent Relay attaches instead of spawning
+
+Every other adapter owns a local subprocess: `startSession` spawns it, `stopSession`
+kills it, and the adapter is the sole client of its stdio. [Agent Relay's
+adapter](../../apps/server/src/provider/Layers/AgentRelayAdapter.ts) does neither —
+it opens an outbound WebSocket to a broker process this server does not manage, and
+attaches to an agent Agent Relay is already running. That agent's lifecycle is
+independent of the thread: stopping the T3 Code session closes this client's socket,
+not the agent, and other clients (including Agent Relay's own terminal UI) can be
+attached to the same broker session concurrently. Assumptions elsewhere in this
+directory that the adapter is the only thing writing to the process (e.g. approval
+gating) do not hold here — a message another attached client typed can appear as
+input this adapter never sent.
+
+v1 speaks only the broker's terminal transport (`worker_stream` frames in,
+`sendInput` frames out), so there are no structured turn, tool-call, or approval
+events — turn completion is inferred from the terminal going quiet
+(`TURN_IDLE_COMPLETE_MS`), not reported by the agent. Agent Relay's structured
+`AgentEventEnvelope` protocol (`@agent-relay/harness-driver`) would remove that
+heuristic and add real approvals, but only two Agent Relay harnesses speak it
+natively today; adopting it is a distinct v2 adapter, not a v1 extension.
+
 ## Setup must not happen as a health-check side effect
 
 Opening a provider session can start MCP servers, run hooks, or launch a login browser.

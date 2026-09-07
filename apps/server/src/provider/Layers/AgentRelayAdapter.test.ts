@@ -211,7 +211,12 @@ it.layer(agentRelayAdapterTestLayer)("AgentRelayAdapterLive", (it) => {
         '{"chunk":"2.1.263 (Claude Code)\\r\\n\\u001b[?25h","kind":"worker_stream","name":"Worker1","offset":29,"stream":"stdout"}',
       );
       const delta = yield* waitForEvent(events, "content.delta");
-      assert.equal(delta.payload.streamKind, "command_output");
+      // Tagged `"assistant_text"`, not `"command_output"`: Agent Relay has
+      // no structured split between "model output" and "tool output" —
+      // it's all one raw terminal stream — and `ProviderRuntimeIngestion`
+      // only turns `"assistant_text"` deltas into visible transcript
+      // content, silently dropping every other stream kind.
+      assert.equal(delta.payload.streamKind, "assistant_text");
       assert.equal(delta.payload.delta, "2.1.263 (Claude Code)\r\n[?25h");
 
       yield* adapter.sendTurn({ threadId, input: "hello agent" });

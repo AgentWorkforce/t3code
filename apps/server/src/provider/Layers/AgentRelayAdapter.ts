@@ -94,6 +94,16 @@ const TURN_IDLE_COMPLETE_MS = 1_500;
 const AGENT_SPAWN_WAIT_TIMEOUT = Duration.seconds(90);
 const AGENT_SPAWN_POLL_INTERVAL = Duration.seconds(2);
 
+// `startSession` returns as soon as the WebSocket connect is *initiated*
+// (`connect()` is fire-and-forget — see its own comment) so the session is
+// still `"connecting"` when orchestration's first `sendTurn` call lands
+// moments later; the handshake has not necessarily finished. Give it a
+// short grace window to reach `"ready"` before treating that as a real
+// failure, since the alternative is every new Agent Relay thread's first
+// message reliably losing this race and erroring out.
+const CONNECT_WAIT_TIMEOUT = Duration.seconds(15);
+const CONNECT_POLL_INTERVAL = Duration.millis(50);
+
 /** Durable per-thread continuation state for workspace mode, round-tripped
  * through `ProviderSession.resumeCursor` / `ProviderSessionDirectory` the
  * same way `CodexResumeCursorSchema` persists a rollout id. Absent (or
@@ -165,6 +175,26 @@ function waitForAgentOnline(
           }),
     ),
   );
+}
+
+/**
+ * Blocks while `ctx.session.status` is still `"connecting"`, so a `sendTurn`
+ * that lands right after `startSession` waits out the WebSocket handshake
+ * instead of immediately erroring. Returns as soon as the status moves to
+ * anything else (`"ready"` from `handleOpen`, or `"error"` from a failed
+ * connect/close) — `sendTurn`'s existing status check is what turns an
+ * `"error"` outcome here into the right user-facing message.
+ */
+function awaitSessionConnected(
+  ctx: AgentRelaySessionContext,
+): Effect.Effect<void, ProviderAdapterRequestError> {
+  const pollUntilSettled = Effect.gen(function* () {
+    while (ctx.session.status === "connecting") {
+      yield* Effect.sleep(CONNECT_POLL_INTERVAL);
+    }
+  });
+
+  return pollUntilSettled.pipe(Effect.timeoutOption(CONNECT_WAIT_TIMEOUT), Effect.asVoid);
 }
 
 export interface AgentRelayAdapterLiveOptions {
@@ -399,7 +429,17 @@ export function makeAgentRelayAdapter(
           provider: PROVIDER,
           threadId: ctx.threadId,
           ...(ctx.activeTurnId ? { turnId: ctx.activeTurnId } : {}),
-          payload: { streamKind: "command_output", delta: frame.text },
+          // `"command_output"` (what this reads as, structurally) is for a
+          // structured adapter to stream a tool call's output alongside its
+          // own separate `"assistant_text"` — `ProviderRuntimeIngestion`
+          // only turns `"assistant_text"` deltas into visible message
+          // content and silently drops every other stream kind. Agent
+          // Relay has no such split: the raw terminal stream *is* the
+          // entire response, so it has to be tagged `"assistant_text"` to
+          // ever reach the transcript at all. Confirmed live: broker
+          // frames arrived and the session reached "ready" with this
+          // tagged as `"command_output"`, but nothing rendered.
+          payload: { streamKind: "assistant_text", delta: frame.text },
         });
       });
 
@@ -635,6 +675,9 @@ export function makeAgentRelayAdapter(
     const sendTurn: AgentRelayAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
+        if (ctx.session.status === "connecting") {
+          yield* awaitSessionConnected(ctx);
+        }
         if (ctx.session.status !== "ready" && ctx.session.status !== "running") {
           return yield* new ProviderAdapterRequestError({
             provider: PROVIDER,

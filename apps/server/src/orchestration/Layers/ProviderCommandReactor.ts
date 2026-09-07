@@ -31,6 +31,7 @@ import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { increment, orchestrationEventsProcessedTotal } from "../../observability/Metrics.ts";
+import { isExternalSessionMarkerThreadId } from "../../project/ExternalSessionHooks.ts";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterValidationError,
@@ -1190,6 +1191,26 @@ const make = Effect.gen(function* () {
 
     const thread = yield* resolveThreadShell(event.payload.threadId);
     if (!thread) {
+      return;
+    }
+    // A thread minted by the external-session lifecycle hooks is a read-only
+    // historical marker for a session T3 Code never ran — there is no PTY or
+    // provider session to attach to. Nothing server-side stops a client from
+    // sending it a message (see ExternalSessionHooks.ts), so refuse to start
+    // a real provider session here instead of silently spawning one inside
+    // what the user sees as a read-only marker thread.
+    if (isExternalSessionMarkerThreadId(event.payload.threadId)) {
+      yield* appendProviderFailureActivity({
+        threadId: event.payload.threadId,
+        kind: "provider.turn.start.failed",
+        summary: "Provider turn start failed",
+        detail:
+          "This thread is a read-only marker for a session started outside T3 Code. It has no " +
+          "live provider session to attach to and cannot start a new one.",
+        turnId: null,
+        createdAt: event.payload.createdAt,
+        requestId: event.payload.messageId,
+      });
       return;
     }
     const turnStart = yield* projectionSnapshotQuery.getTurnStartMessage({

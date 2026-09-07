@@ -1258,6 +1258,76 @@ describe("ProviderCommandReactor", () => {
     }),
   );
 
+  effectIt.effect("refuses to start a provider session on an external-session marker thread", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() => createHarness());
+      const now = "2026-01-01T00:00:00.000Z";
+      // Same id shape ExternalSessionHooks.ts mints for a Claude Code /
+      // Codex session started outside T3 Code (see
+      // `externalSessionThreadId`/`isExternalSessionMarkerThreadId`).
+      const markerThreadId = ThreadId.make("external:claude:session-outside-t3");
+
+      yield* harness.engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-marker-thread-create"),
+        threadId: markerThreadId,
+        projectId: asProjectId("project-1"),
+        title: "External Claude Code session",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt: now,
+        historyImport: true,
+      });
+
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-on-marker-thread"),
+        threadId: markerThreadId,
+        message: {
+          messageId: asMessageId("user-message-on-marker-thread"),
+          role: "user",
+          text: "hello",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      });
+
+      yield* Effect.promise(() =>
+        waitFor(async () => {
+          const thread = (await harness.readModel()).threads.find(
+            (entry) => entry.id === markerThreadId,
+          );
+          return (
+            thread?.activities.some(
+              (activity) => activity.kind === "provider.turn.start.failed",
+            ) === true
+          );
+        }),
+      );
+
+      const thread = (yield* Effect.promise(() => harness.readModel())).threads.find(
+        (entry) => entry.id === markerThreadId,
+      );
+      expect(
+        thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
+      ).toMatchObject({
+        summary: "Provider turn start failed",
+        payload: { detail: expect.stringContaining("read-only marker") },
+      });
+      expect(thread?.session).toBeNull();
+      expect(harness.startSession).not.toHaveBeenCalled();
+      expect(harness.sendTurn).not.toHaveBeenCalled();
+    }),
+  );
+
   effectIt.effect("shows the missing workspace message without a provider stack trace", () =>
     Effect.gen(function* () {
       const attempted = yield* Deferred.make<void>();

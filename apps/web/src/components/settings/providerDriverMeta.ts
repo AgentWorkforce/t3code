@@ -1,4 +1,5 @@
 import {
+  AgentRelaySettings,
   AntigravitySettings,
   ClaudeSettings,
   CodexSettings,
@@ -9,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 import type * as Schema from "effect/Schema";
 import {
+  AgentRelayIcon,
   AntigravityIcon,
   ClaudeAI,
   CursorIcon,
@@ -81,6 +83,13 @@ const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = [
     label: "Antigravity",
     icon: AntigravityIcon,
     settingsSchema: AntigravitySettings,
+  },
+  {
+    value: ProviderDriverKind.make("agentrelay"),
+    label: "Agent Relay",
+    icon: AgentRelayIcon,
+    badgeLabel: "Early Access",
+    settingsSchema: AgentRelaySettings,
   },
 ];
 

@@ -475,6 +475,9 @@ importers:
 
   apps/server:
     dependencies:
+      '@agent-relay/sdk':
+        specifier: ^11.10.3
+        version: 11.10.3
       '@anthropic-ai/claude-agent-sdk':
         specifier: ^0.3.260
         version: 0.3.260(@anthropic-ai/sdk@0.93.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(zod@4.4.3)
@@ -508,6 +511,9 @@ importers:
       stream-json:
         specifier: 3.6.0
         version: 3.6.0
+      ws:
+        specifier: ^8.18.0
+        version: 8.21.0(bufferutil@4.1.0)(utf-8-validate@6.0.6)
       yaml:
         specifier: ^2.9.0
         version: 2.9.0
@@ -536,6 +542,9 @@ importers:
       '@types/node':
         specifier: 24.12.4
         version: 24.12.4
+      '@types/ws':
+        specifier: ^8.5.13
+        version: 8.18.1
       '@types/yauzl':
         specifier: ^3.4.0
         version: 3.4.0
@@ -1005,6 +1014,10 @@ importers:
         version: 0.3.0(@types/node@24.12.4)(bufferutil@4.1.0)(esbuild@0.28.1)(jiti@2.7.0)(msw@2.12.11(@types/node@24.12.4)(typescript@6.0.3))(terser@5.48.0)(typescript@6.0.3)(unrun@0.2.39)(utf-8-validate@6.0.6)(yaml@2.9.0)
 
 packages:
+
+  '@agent-relay/sdk@11.10.3':
+    resolution: {integrity: sha512-/1vEi8uU2QWZHjAlsBTSLFSGxAuCoaftcdIb1oCfCKvZw0mU6tkjV2CDYK7zMc3ikbeN5SzNx18lbSgE0YN8aA==}
+    engines: {node: '>=22.0.0'}
 
   '@ai-sdk/provider-utils@4.0.49':
     resolution: {integrity: sha512-8e7pd+82bobqrFOaD5dG/PiEuvLYr5olaE3I56ch0jipR0H7sGD6ohwTUynv6k8O8QidWiyIbEsZCtr/2dyXIA==}
@@ -4278,6 +4291,12 @@ packages:
 
   '@react-navigation/routers@7.6.0':
     resolution: {integrity: sha512-lblhDXfS75jLc7G2K7BZGM+7cjqQXk13X/MA4fq/12r62zM+fBhhreLzYflSitrDDXFRJpSvJXy0ziiGU04Xow==}
+
+  '@relaycast/sdk@8.4.0':
+    resolution: {integrity: sha512-k6OsQ+0GBwnNv/PZ2bVLg7Yr/mruKm2X/uYfn9VIhlPj7NllDyUuIEiKuEHU3kGSIlpkW68fmWiVKZTnuxV3xQ==}
+
+  '@relaycast/types@8.4.0':
+    resolution: {integrity: sha512-m5DIqV/ngA9p3bpi9wGIY/oUElwrNW5pqMKf3Kg10Xh/a5bmQaIH8dGOrqocHYB4sOsnaJlnacvWdTw5+VpXLA==}
 
   '@rolldown/binding-android-arm64@1.0.0-rc.17':
     resolution: {integrity: sha512-s70pVGhw4zqGeFnXWvAzJDlvxhlRollagdCCKRgOsgUOH3N1l0LIxf83AtGzmb5SiVM4Hjl5HyarMRfdfj3DaQ==}
@@ -10812,6 +10831,12 @@ packages:
 
 snapshots:
 
+  '@agent-relay/sdk@11.10.3':
+    dependencies:
+      '@relaycast/sdk': 8.4.0
+      '@relaycast/types': 8.4.0
+      zod: 4.4.3
+
   '@ai-sdk/provider-utils@4.0.49(zod@4.4.3)':
     dependencies:
       '@ai-sdk/provider': 3.0.15
@@ -14481,6 +14506,15 @@ snapshots:
   '@react-navigation/routers@7.6.0':
     dependencies:
       nanoid: 3.3.12
+
+  '@relaycast/sdk@8.4.0':
+    dependencies:
+      '@relaycast/types': 8.4.0
+      zod: 4.4.3
+
+  '@relaycast/types@8.4.0':
+    dependencies:
+      zod: 4.4.3
 
   '@rolldown/binding-android-arm64@1.0.0-rc.17':
     optional: true

@@ -703,6 +703,20 @@ export const ACPRegistryIcon: Icon = ({ className, ...props }) => (
   </svg>
 );
 
+export const AgentRelayIcon: Icon = ({ className, ...props }) => (
+  <svg
+    {...props}
+    viewBox="0 0 24 24"
+    fill="none"
+    className={cn("fill-none stroke-black dark:stroke-white", className)}
+  >
+    <circle cx="5" cy="12" r="2.5" strokeWidth="1.5" />
+    <circle cx="19" cy="5" r="2.5" strokeWidth="1.5" />
+    <circle cx="19" cy="19" r="2.5" strokeWidth="1.5" />
+    <path d="M7.3 10.8 16.7 6.2M7.3 13.2l9.4 4.6" strokeWidth="1.5" strokeLinecap="round" />
+  </svg>
+);
+
 export const PiAgentIcon: Icon = ({ className, ...props }) => (
   <svg {...props} viewBox="0 0 800 800" className={cn("fill-none", className)}>
     <rect width="800" height="800" rx="160" fill="#000" />

@@ -67,8 +67,11 @@ export class NetService extends Context.Service<NetService, NetServiceShape>()(
 export const make = () => {
   /**
    * Returns true when a TCP server can bind to {host, port}.
-   * `EADDRNOTAVAIL` is treated as available so IPv6-absent hosts don't fail
-   * loopback availability checks.
+   * `EADDRNOTAVAIL` and `EAFNOSUPPORT` are treated as available so
+   * IPv6-absent hosts don't fail loopback availability checks — a host
+   * with no IPv6 stack at all (some sandboxed/containerized environments)
+   * raises `EAFNOSUPPORT` for `::1`, not `EADDRNOTAVAIL`; both mean "this
+   * address family isn't usable here," not "the port is taken."
    */
   const canListenOnHost = (port: number, host: string): Effect.Effect<boolean> =>
     Effect.callback<boolean>((resume) => {
@@ -84,7 +87,10 @@ export const make = () => {
       server.unref();
 
       server.once("error", (cause) => {
-        if (isErrnoExceptionWithCode(cause) && cause.code === "EADDRNOTAVAIL") {
+        if (
+          isErrnoExceptionWithCode(cause) &&
+          (cause.code === "EADDRNOTAVAIL" || cause.code === "EAFNOSUPPORT")
+        ) {
           settle(true);
           return;
         }

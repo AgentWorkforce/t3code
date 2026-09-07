@@ -38,6 +38,7 @@ import { ProviderSessionDirectoryLive } from "../src/provider/Layers/ProviderSes
 import * as ProviderService from "../src/provider/Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../src/provider/Services/ProviderSessionDirectory.ts";
 import * as ProviderSessionReaper from "../src/provider/Services/ProviderSessionReaper.ts";
+import * as AgentRelayThreadDiscoveryReactor from "../src/provider/Services/AgentRelayThreadDiscoveryReactor.ts";
 import * as RepositoryIdentityResolver from "../src/project/RepositoryIdentityResolver.ts";
 import * as ServerLifecycleEvents from "../src/serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "../src/serverRuntimeStartup.ts";
@@ -77,6 +78,9 @@ const startupDependencies = Layer.mergeAll(
     start: () => Effect.void,
   }),
   Layer.succeed(ProviderSessionReaper.ProviderSessionReaper, {
+    start: () => Effect.void,
+  }),
+  Layer.succeed(AgentRelayThreadDiscoveryReactor.AgentRelayThreadDiscoveryReactor, {
     start: () => Effect.void,
   }),
   ServerLifecycleEvents.layer,

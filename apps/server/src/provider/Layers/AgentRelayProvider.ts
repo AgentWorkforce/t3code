@@ -34,9 +34,14 @@ const EMPTY_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
 // Agent Relay does not expose a model catalog to t3code — the underlying
 // agent's model is chosen inside Agent Relay, not here. This single entry
 // gives the composer something to select so the thread has a model label.
+// Exported so `AgentRelayThreadDiscoveryReactor` can stamp the same slug on
+// threads it materializes for already-running agents, instead of forking a
+// second "the model label" constant that could drift from this one.
+export const AGENT_RELAY_DEFAULT_MODEL_SLUG = "relay-agent";
+
 const AGENT_RELAY_BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
   {
-    slug: "relay-agent",
+    slug: AGENT_RELAY_DEFAULT_MODEL_SLUG,
     name: "Relay Agent",
     isCustom: false,
     capabilities: EMPTY_CAPABILITIES,

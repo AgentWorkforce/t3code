@@ -132,20 +132,54 @@ not be verified end-to-end against a live workspace, so `waitForAgentOnline`
 races it against polling `listAgents()` every two seconds (bounded by
 `AGENT_SPAWN_WAIT_TIMEOUT`, 90s); polling alone is sufficient for correctness.
 
-### Left out: auto-materializing threads for already-running agents
+### Auto-materializing threads for already-running agents
 
-`AgentRelayWorkspaceClient` can already list every agent in a workspace and watch
-presence, which is the primitive auto-discovery (surfacing an agent nobody started
-from T3 Code as a thread) needs. What it does not do is turn that into a thread:
-`thread.create` (`apps/server/src/orchestration/decider.ts`) requires a
-`projectId`, and every existing thread-creation path is a deliberate user action.
-Silently materializing a thread per discovered agent needs a product decision this
-change does not make on its own — at minimum, which project houses them and
-whether every agent in a workspace should really become a thread unasked. A
-follow-up background reactor (shaped like
-`apps/server/src/provider/Layers/ProviderSessionReaper.ts`) is the right place to
-wire `AgentRelayWorkspaceClient.listAgents`/`onPresenceChange` into `thread.create`
-dispatch once that's decided.
+Every online agent in a Workspace-mode instance now gets a T3 Code thread
+automatically, whether it was spawned by T3 Code, Agent Relay's own CLI, its
+MCP tools, or a fleet trigger. `AgentRelayThreadDiscoveryReactor.ts`
+(`apps/server/src/provider/Layers/`) polls `AgentRelayWorkspaceClient.listAgents`
+the same way `ProviderSessionReaper.ts` polls provider bindings, and reuses two
+mechanisms that already existed rather than inventing new ones:
+
+- **Which project houses a discovered agent.** `thread.create`
+  (`apps/server/src/orchestration/decider.ts`) requires a `projectId`, and
+  `commandInvariants.ts`'s `requireActiveProjectWorkspaceRootAbsent` only
+  string-compares `workspaceRoot` for uniqueness — it never checks the
+  filesystem, and `CheckpointReactor.ts`'s `isGitRepository` guard already
+  no-ops checkpoint capture on a non-git directory. So a synthetic project
+  only needs a directory to exist, never a git init: nothing ever writes to
+  it, since the actual agent runs on Agent Relay's side, not on this
+  filesystem. The reactor creates one project per provider _instance_ (not
+  per agent, since agents come and go but the project is their durable home)
+  lazily, the first time a sweep finds an unclaimed online agent for that
+  instance, under `<T3 home>/agent-relay/<instanceId>` via
+  `WorkspacePaths.normalizeWorkspaceRoot(..., { createIfMissing: true })` —
+  the same helper `project.create`'s own client-command normalizer uses, so
+  there is nothing for a human to browse to and pick.
+- **How a materialized thread attaches instead of spawning.** No new
+  attach-signal plumbing was needed: `AgentSessionImporter.ts` already
+  established the precedent of installing a `ProviderSessionDirectory`
+  binding carrying a `resumeCursor` _before_ the thread becomes visible
+  (`onConflict: "ignore"`), then dispatching `thread.create`.
+  `ProviderService.startSession` already prefers a persisted binding's
+  `resumeCursor` over spawning fresh, so a freshly materialized thread's
+  first turn attaches to the discovered agent by name
+  (`AgentRelayAdapter.startSession`'s `isAgentRelayResumeCursor` check) the
+  same way a resumed thread does.
+
+"Already claimed" is answered by scanning `ProviderSessionDirectory.listBindings()`
+for this instance's bindings and reading each one's `resumeCursor.agentName` —
+the same directory `ProviderSessionReaper` already scans — rather than a second,
+parallel bookkeeping table.
+
+An agent that drops out of `listAgents()` settles its thread (the same
+`thread.settle` verb `ExternalSessionHooks` uses for "session ended") once it
+has stayed unconfirmed online for a debounce window, not on the first miss:
+presence data here is the same unverified-end-to-end signal described above,
+so a single missed sweep is not proof an agent is gone. Sending the settled
+thread a new message unsettles it automatically (`decider.ts`'s
+`thread.turn-start-requested` handling already resets any settled override on
+real activity), so nothing needed to reverse this if the agent comes back.
 
 ## Setup must not happen as a health-check side effect
 

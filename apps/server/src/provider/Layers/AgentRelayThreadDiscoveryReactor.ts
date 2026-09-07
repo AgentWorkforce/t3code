@@ -54,6 +54,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 
 import { ServerConfig } from "../../config.ts";
@@ -63,7 +64,6 @@ import { forkParked } from "../../serverActivation.ts";
 import { WorkspacePaths } from "../../workspace/WorkspacePaths.ts";
 import type { ProviderInstance } from "../ProviderDriver.ts";
 import type { AgentRelayAdapterShape } from "../Services/AgentRelayAdapter.ts";
-import type { AgentRelayWorkspaceAgentSummary } from "../Services/AgentRelayWorkspaceClient.ts";
 import {
   AgentRelayThreadDiscoveryReactor,
   type AgentRelayThreadDiscoveryReactorShape,
@@ -195,18 +195,41 @@ const makeAgentRelayThreadDiscoveryReactor = (
     /** Agent names already bound to a thread for this instance, discovered
      * the same way `ProviderSessionReaper` already scans bindings — reusing
      * `ProviderSessionDirectory` instead of a second, parallel "is this
-     * agent claimed" table. */
+     * agent claimed" table.
+     *
+     * `materializeThread` installs the binding *before* dispatching
+     * `thread.create` (see its own comment for why), so a dispatch failure
+     * between those two steps leaves a binding pointing at a thread that
+     * was never actually created. Without checking that the thread exists,
+     * that binding would mark the agent "claimed" forever — permanently
+     * skipping it on every future sweep even though nothing ever
+     * materialized. Filtering to bindings with a real thread means a
+     * failed attempt just gets retried (with a new thread id) on the next
+     * sweep instead, at the cost of leaving a harmless orphaned binding
+     * row behind for the failed attempt. */
     const claimedAgentNamesForInstance = Effect.fn("claimedAgentNamesForInstance")(function* (
       instanceId: ProviderInstanceId,
     ) {
       const bindings = yield* directory.listBindings();
+      const candidates = bindings.filter(
+        (binding) =>
+          binding.provider === AGENT_RELAY_DRIVER_KIND &&
+          binding.providerInstanceId === instanceId &&
+          isAgentRelayResumeCursor(binding.resumeCursor),
+      );
       const claimed = new Map<string, ThreadId>();
-      for (const binding of bindings) {
-        if (binding.provider !== AGENT_RELAY_DRIVER_KIND) continue;
-        if (binding.providerInstanceId !== instanceId) continue;
-        if (!isAgentRelayResumeCursor(binding.resumeCursor)) continue;
-        claimed.set(binding.resumeCursor.agentName, binding.threadId);
-      }
+      yield* Effect.forEach(
+        candidates,
+        (binding) =>
+          projectionSnapshotQuery.getThreadShellById(binding.threadId).pipe(
+            Effect.map((thread) => {
+              if (Option.isSome(thread) && isAgentRelayResumeCursor(binding.resumeCursor)) {
+                claimed.set(binding.resumeCursor.agentName, binding.threadId);
+              }
+            }),
+          ),
+        { discard: true },
+      );
       return claimed;
     });
 
@@ -321,9 +344,24 @@ const makeAgentRelayThreadDiscoveryReactor = (
     const sweepInstance = Effect.fn("sweepInstance")(function* (
       instance: AgentRelayWorkspaceInstance,
     ) {
-      const agents = yield* instance
-        .listWorkspaceAgents()
-        .pipe(Effect.orElseSucceed((): ReadonlyArray<AgentRelayWorkspaceAgentSummary> => []));
+      // A failed listing is not the same thing as a successful listing
+      // that came back empty: substituting `[]` for a transport/SDK
+      // failure (the previous behavior) would run every currently-claimed
+      // agent below through the same "not in onlineNames" path a real
+      // offline agent takes — an outage lasting longer than
+      // `offlineDebounceMs` would then settle every one of this
+      // instance's threads even though nothing actually went offline.
+      // Skip this sweep for the instance entirely instead, leaving
+      // existing presence untouched until a listing actually succeeds.
+      const agentsResult = yield* instance.listWorkspaceAgents().pipe(Effect.result);
+      if (Result.isFailure(agentsResult)) {
+        yield* Effect.logWarning("agentrelay.discovery.list-agents-failed", {
+          instanceId: instance.instanceId,
+          cause: agentsResult.failure,
+        });
+        return;
+      }
+      const agents = agentsResult.success;
       const onlineNames = new Set(
         agents.filter((agent) => agent.status === "online").map((agent) => agent.name),
       );

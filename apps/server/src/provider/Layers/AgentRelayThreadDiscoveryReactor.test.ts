@@ -21,6 +21,7 @@ import { ServerConfig } from "../../config.ts";
 import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as WorkspacePaths from "../../workspace/WorkspacePaths.ts";
+import { ProviderAdapterRequestError } from "../Errors.ts";
 import type { ProviderInstance } from "../ProviderDriver.ts";
 import type { AgentRelayAdapterShape } from "../Services/AgentRelayAdapter.ts";
 import { AgentRelayThreadDiscoveryReactor } from "../Services/AgentRelayThreadDiscoveryReactor.ts";
@@ -197,6 +198,7 @@ function makeHarness(input: {
   readonly seedBinding?: ProviderRuntimeBinding;
 }) {
   let agents: ReadonlyArray<FakeAgent> = input.agents;
+  let listShouldFail = false;
   const directory = makeFakeDirectory();
   if (input.seedBinding) {
     directory.seed(input.seedBinding);
@@ -240,7 +242,17 @@ function makeHarness(input: {
 
   const instance = makeAgentRelayInstance({
     ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
-    adapter: makeAgentRelayAdapter(() => Effect.sync(() => agents)),
+    adapter: makeAgentRelayAdapter(() =>
+      listShouldFail
+        ? Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: AGENT_RELAY,
+              method: "workspace.agents.list",
+              detail: "simulated transport failure",
+            }),
+          )
+        : Effect.sync(() => agents),
+    ),
   });
 
   const dependencies = Layer.mergeAll(
@@ -266,6 +278,9 @@ function makeHarness(input: {
     threadsById,
     setAgents: (next: ReadonlyArray<FakeAgent>) => {
       agents = next;
+    },
+    setListFailing: (fail: boolean) => {
+      listShouldFail = fail;
     },
     dependencies,
   };
@@ -331,6 +346,16 @@ it.layer(NodeServices.layer)("AgentRelayThreadDiscoveryReactor", (it) => {
             resumeCursor: { agentName: "Worker2" },
           },
         });
+        // The binding alone isn't enough to count as "claimed" (see
+        // `claimedAgentNamesForInstance`'s comment) — a real thread has to
+        // exist for it too, so this fixture needs one, same as production.
+        harness.threadsById.set(
+          existingThreadId,
+          makeThreadShell(existingThreadId, ProjectId.make("existing-project"), "Worker2", {
+            instanceId: INSTANCE_ID,
+            model: AGENT_RELAY_DEFAULT_MODEL_SLUG,
+          }),
+        );
         yield* startReactor(harness.dependencies);
         // Give the sweep a chance to run: since it must NOT dispatch
         // anything, wait on the real clock instead of a signal that never
@@ -341,6 +366,45 @@ it.layer(NodeServices.layer)("AgentRelayThreadDiscoveryReactor", (it) => {
         assert.isUndefined(harness.commands.find((command) => command.type === "project.create"));
       }),
     ),
+  );
+
+  it.effect(
+    "retries materializing an agent whose binding points at a thread that was never created",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          // Simulates the crash window in `materializeThread`: the
+          // `ProviderSessionDirectory` binding is installed before
+          // `thread.create` dispatches, so a failure between those two
+          // steps leaves a binding whose `threadId` was never actually
+          // created. Without checking that the thread exists, this agent
+          // would be "claimed" forever and never retried.
+          const phantomThreadId = ThreadId.make("thread-never-created");
+          const harness = makeHarness({
+            agents: [{ name: "Worker5", status: "online" }],
+            seedBinding: {
+              threadId: phantomThreadId,
+              provider: AGENT_RELAY,
+              providerInstanceId: INSTANCE_ID,
+              status: "stopped",
+              resumeCursor: { agentName: "Worker5" },
+            },
+          });
+          // Deliberately no `harness.threadsById.set(phantomThreadId, ...)`
+          // — that's the point: the binding exists, the thread doesn't.
+
+          yield* startReactor(harness.dependencies);
+          yield* waitUntil(() =>
+            harness.commands.some((command) => command.type === "thread.create"),
+          );
+
+          const threadCreate = harness.commands.find((command) => command.type === "thread.create");
+          assert.isDefined(threadCreate);
+          if (threadCreate?.type !== "thread.create") return assert.fail("expected thread.create");
+          assert.strictEqual(threadCreate.title, "Worker5");
+          assert.notStrictEqual(threadCreate.threadId, phantomThreadId);
+        }),
+      ),
   );
 
   it.effect(
@@ -393,6 +457,55 @@ it.layer(NodeServices.layer)("AgentRelayThreadDiscoveryReactor", (it) => {
           if (settle?.type !== "thread.settle") return assert.fail("expected thread.settle");
           assert.strictEqual(settle.threadId, boundThreadId);
           assert.strictEqual(harness.threadsById.get(boundThreadId)?.settledOverride, "settled");
+        }),
+      ),
+  );
+
+  it.effect(
+    "does not settle a bound thread when listWorkspaceAgents fails, even past the debounce window",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          // A failed listing is not the same as a successful listing that
+          // came back empty (the previous test): substituting `[]` for a
+          // transport/SDK failure would run this exact scenario through
+          // the same "not in onlineNames" path a real offline agent
+          // takes, settling the thread even though nothing actually went
+          // offline — an outage is not proof of absence.
+          const boundThreadId = ThreadId.make("thread-listing-fails");
+          const harness = makeHarness({
+            agents: [{ name: "Worker4", status: "online" }],
+            seedBinding: {
+              threadId: boundThreadId,
+              provider: AGENT_RELAY,
+              providerInstanceId: INSTANCE_ID,
+              status: "running",
+              resumeCursor: { agentName: "Worker4" },
+            },
+          });
+          harness.threadsById.set(
+            boundThreadId,
+            makeThreadShell(boundThreadId, ProjectId.make("existing-project"), "Worker4", {
+              instanceId: INSTANCE_ID,
+              model: AGENT_RELAY_DEFAULT_MODEL_SLUG,
+            }),
+          );
+
+          yield* startReactor(harness.dependencies, {
+            sweepIntervalMs: 1_000,
+            offlineDebounceMs: 5_000,
+          });
+          // First sweep: online, seeds "last seen online".
+          yield* Effect.sleep(Duration.millis(50)).pipe(TestClock.withLive);
+
+          harness.setListFailing(true);
+          // Every sweep from here on fails to list — well past the
+          // debounce window, but the thread must stay untouched.
+          yield* TestClock.adjust("10 seconds");
+          yield* Effect.sleep(Duration.millis(50)).pipe(TestClock.withLive);
+
+          assert.isUndefined(harness.commands.find((command) => command.type === "thread.settle"));
+          assert.strictEqual(harness.threadsById.get(boundThreadId)?.settledOverride, null);
         }),
       ),
   );

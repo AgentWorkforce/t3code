@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   prepare-config:
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk'
     name: Prepare PR size config
     runs-on: ubuntu-24.04
     outputs:
@@ -57,7 +58,9 @@ jobs:
   sync-label-definitions:
     name: Sync PR size label definitions
     needs: prepare-config
-    if: github.event_name != 'pull_request_target'
+    if: >-
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk') &&
+      (github.event_name != 'pull_request_target')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -114,7 +117,9 @@ jobs:
   label:
     name: Label PR size
     needs: prepare-config
-    if: github.event_name == 'pull_request_target'
+    if: >-
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk') &&
+      (github.event_name == 'pull_request_target')
     runs-on: ubuntu-24.04
     permissions:
       contents: read

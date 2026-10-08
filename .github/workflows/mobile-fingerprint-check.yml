@@ -31,6 +31,7 @@ concurrency:
 
 jobs:
   fingerprint:
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk'
     name: Native fingerprint diff
     runs-on: blacksmith-8vcpu-ubuntu-2404
     permissions:

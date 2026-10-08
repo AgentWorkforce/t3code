@@ -15,7 +15,6 @@ permissions:
 
 jobs:
   forward:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk'
     name: POST to Cursor
     runs-on: ubuntu-24.04
     steps:

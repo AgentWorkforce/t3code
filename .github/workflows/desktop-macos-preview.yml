@@ -24,8 +24,11 @@ jobs:
   build:
     name: Build macOS Apple Silicon preview
     if: >-
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk') &&
-      (github.event.action != 'closed' && github.event.action != 'unlabeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'preview:mac') && (github.event.action != 'labeled' || github.event.label.name == 'preview:mac'))
+      github.event.action != 'closed' &&
+      github.event.action != 'unlabeled' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(github.event.pull_request.labels.*.name, 'preview:mac') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'preview:mac')
     runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 30
     outputs:
@@ -120,7 +123,6 @@ jobs:
   # build never notifies release watchers. This job holds the write token and
   # only handles the artifact the build job produced; it never runs PR code.
   publish:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk'
     name: Publish anonymous download
     needs: build
     runs-on: blacksmith-8vcpu-ubuntu-2404
@@ -284,8 +286,9 @@ jobs:
   cleanup:
     name: Remove preview download
     if: >-
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk') &&
-      (github.event.pull_request.head.repo.full_name == github.repository && ((github.event.action == 'closed' && contains(github.event.pull_request.labels.*.name, 'preview:mac')) || (github.event.action == 'unlabeled' && github.event.label.name == 'preview:mac')))
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      ((github.event.action == 'closed' && contains(github.event.pull_request.labels.*.name, 'preview:mac')) ||
+      (github.event.action == 'unlabeled' && github.event.label.name == 'preview:mac'))
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 10
     permissions:
